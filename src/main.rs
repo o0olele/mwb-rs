@@ -7,7 +7,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::FluentBuilder, *};
 use mwb::{
-    config::{Config, new_pairing_key, parse_pairing_key},
+    config::{
+        Config, new_pairing_key, new_pairing_key_with_length, parse_pairing_key,
+        validate_pairing_key,
+    },
     engine::{self, Runtime},
     platform,
     protocol::{MAX_TEXT_BYTES, Message},
@@ -26,10 +29,12 @@ struct Workspace {
     config: Config,
     runtime: Arc<Runtime>,
     secret: Entity<InputState>,
+    key_length: Entity<InputState>,
     address: Entity<InputState>,
     tab: usize,
     notice: String,
     show_key: bool,
+    preparing: bool,
     _refresh: Task<()>,
 }
 
@@ -42,6 +47,7 @@ impl Workspace {
         let runtime = Runtime::new(&config);
         let key = new_pairing_key().expect("Windows secure random source unavailable");
         let secret = cx.new(|cx| InputState::new(window, cx).default_value(key).masked(true));
+        let key_length = cx.new(|cx| InputState::new(window, cx).default_value("64"));
         let address = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("例如 192.168.1.20")
@@ -61,10 +67,12 @@ impl Workspace {
             config,
             runtime,
             secret,
+            key_length,
             address,
             tab: 0,
             notice,
             show_key: false,
+            preparing: false,
             _refresh: refresh,
         }
     }
@@ -76,9 +84,13 @@ impl Workspace {
     }
 
     fn start(&mut self, connect: bool, cx: &mut Context<Self>) {
+        if self.preparing || self.runtime.running.load(Ordering::SeqCst) {
+            return;
+        }
         self.notice.clear();
+        let secret = self.secret.read(cx).value().to_string();
         let result = (|| -> anyhow::Result<()> {
-            let key = parse_pairing_key(&self.secret.read(cx).value())?;
+            validate_pairing_key(&secret)?;
             self.config.peer_address = self.address.read(cx).value().trim().to_string();
             if connect {
                 anyhow::ensure!(
@@ -86,13 +98,54 @@ impl Workspace {
                     "请输入另一台电脑的 IP 或主机名"
                 );
             }
-            let target = connect.then(|| self.config.peer_address.clone());
-            engine::start(self.runtime.clone(), self.config.clone(), key, target)?;
-            self.persist();
             Ok(())
         })();
         if let Err(err) = result {
             self.notice = format!("{err:#}");
+            cx.notify();
+            return;
+        }
+        self.preparing = true;
+        self.notice = "正在准备配对…".into();
+        let target = connect.then(|| self.config.peer_address.clone());
+        // Custom passphrases use a memory-hard KDF; keep it off the UI thread.
+        let key_task = cx
+            .background_executor()
+            .spawn(async move { parse_pairing_key(&secret) });
+        cx.spawn(async move |this, cx| {
+            let key = key_task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.preparing = false;
+                this.notice.clear();
+                match key.and_then(|key| {
+                    engine::start(this.runtime.clone(), this.config.clone(), key, target)
+                }) {
+                    Ok(()) => this.persist(),
+                    Err(err) => this.notice = format!("{err:#}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn generate_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let result = self
+            .key_length
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("随机密钥位数须为 1–64"))
+            .and_then(new_pairing_key_with_length);
+        match result {
+            Ok(key) => {
+                self.secret
+                    .update(cx, |state, cx| state.set_value(key, window, cx));
+                self.notice.clear();
+            }
+            Err(err) => self.notice = format!("{err:#}"),
         }
         cx.notify();
     }
@@ -355,7 +408,7 @@ impl Workspace {
     }
 
     fn connections(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = self.runtime.running.load(Ordering::SeqCst);
+        let running = self.runtime.running.load(Ordering::SeqCst) || self.preparing;
         card()
             .gap_4()
             .child(
@@ -385,7 +438,11 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .gap_3()
-                            .child(div().text_sm().child("1. 两端使用同一个配对密钥"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child("1. 两端使用相同密钥 · 可自定义 1–64 位"),
+                            )
                             .child(Input::new(&self.secret).disabled(running))
                             .child(
                                 div()
@@ -418,24 +475,32 @@ impl Workspace {
                                                 });
                                                 cx.notify();
                                             })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(subtle("随机生成"))
+                                    .child(
+                                        Input::new(&self.key_length)
+                                            .small()
+                                            .w(px(52.))
+                                            .disabled(running),
                                     )
+                                    .child(subtle("位"))
                                     .child(
                                         Button::new("new-key")
                                             .small()
-                                            .ghost()
-                                            .label("重新生成")
+                                            .label("生成密钥")
                                             .disabled(running)
                                             .on_click(cx.listener(|this, _, window, cx| {
-                                                match new_pairing_key() {
-                                                    Ok(key) => this.secret.update(cx, |s, cx| {
-                                                        s.set_value(key, window, cx)
-                                                    }),
-                                                    Err(err) => this.notice = err.to_string(),
-                                                }
-                                                cx.notify();
+                                                this.generate_key(window, cx)
                                             })),
                                     ),
                             )
+                            .child(subtle("可直接输入短口令；短密钥更容易被猜中。"))
                             .child(subtle("密钥仅在本次运行保留，不写入配置。")),
                     )
                     .child(div().w(px(1.)).bg(rgb(BORDER)))
@@ -463,7 +528,11 @@ impl Workspace {
                                         Button::new("connect")
                                             .primary()
                                             .icon(assets::IconName::ArrowRight)
-                                            .label("连接电脑")
+                                            .label(if self.preparing {
+                                                "准备配对…"
+                                            } else {
+                                                "连接电脑"
+                                            })
                                             .disabled(running)
                                             .on_click(
                                                 cx.listener(|this, _, _, cx| this.start(true, cx)),

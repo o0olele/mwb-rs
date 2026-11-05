@@ -156,15 +156,38 @@ mod tests {
     }
 
     #[test]
+    fn matching_short_passphrases_establish_an_encrypted_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let other = thread::spawn(move || {
+            let key = crate::config::parse_pairing_key("1234").unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
+            handshake(&mut socket, &key, false).unwrap()
+        });
+        let key = crate::config::parse_pairing_key("1234").unwrap();
+        let mut socket = TcpStream::connect(addr).unwrap();
+        let mut client = handshake(&mut socket, &key, true).unwrap();
+        let mut server = other.join().unwrap();
+        let expected = Message::Move { dx: 8, dy: -3 };
+        let mut frame = encode(&mut client, &expected).unwrap();
+        assert_eq!(
+            decode_available(&mut server, &mut frame).unwrap(),
+            vec![expected]
+        );
+    }
+
+    #[test]
     fn different_pairing_keys_fail_authentication() {
+        let server_key = crate::config::parse_pairing_key("1234").unwrap();
+        let client_key = crate::config::parse_pairing_key("1235").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let other = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            handshake(&mut socket, &[7; 32], false).is_err()
+            handshake(&mut socket, &server_key, false).is_err()
         });
         let mut socket = TcpStream::connect(addr).unwrap();
-        assert!(handshake(&mut socket, &[8; 32], true).is_err());
+        assert!(handshake(&mut socket, &client_key, true).is_err());
         assert!(other.join().unwrap());
     }
 }
