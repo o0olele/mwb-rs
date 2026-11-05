@@ -107,7 +107,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
             return CallNextHookEx(None, code, wp, lp);
         }
         if rt.incoming.load(Ordering::Relaxed) {
-            rt.reclaim();
+            rt.return_local();
             return CallNextHookEx(None, code, wp, lp);
         }
         let kind = wp.0 as u32;
@@ -208,7 +208,7 @@ unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
             return CallNextHookEx(None, code, wp, lp);
         }
         if rt.incoming.load(Ordering::Relaxed) {
-            rt.reclaim();
+            rt.return_local();
             return CallNextHookEx(None, code, wp, lp);
         }
         if rt.remote.load(Ordering::Relaxed)

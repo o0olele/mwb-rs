@@ -158,7 +158,7 @@ impl Workspace {
             match platform::install_hooks(self.runtime.clone()) {
                 Ok(()) => {
                     self.runtime.enabled.store(true, Ordering::SeqCst);
-                    self.notice = "共享已开启。另一台电脑也需开启共享，随后可从屏幕边缘切换".into();
+                    self.notice = "共享已恢复，可从屏幕边缘切换到另一台电脑".into();
                 }
                 Err(err) => self.notice = format!("输入捕获启动失败：{err:#}"),
             }
@@ -295,7 +295,7 @@ impl Workspace {
                         div()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child("v0.1.0 · Windows 预览版"),
+                            .child(format!("v{} · Windows 预览版", env!("CARGO_PKG_VERSION"))),
                     ),
             )
     }
@@ -353,7 +353,7 @@ impl Workspace {
                             .icon(assets::IconName::ArrowLeftRight)
                             .label("交换位置")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.runtime.reclaim();
+                                this.runtime.return_local();
                                 this.config.peer_on_right = !this.config.peer_on_right;
                                 this.runtime
                                     .right
@@ -566,9 +566,11 @@ impl Workspace {
                             } else if incoming {
                                 "正在接收另一台电脑的输入"
                             } else if enabled {
-                                "共享已开启 · 从屏幕边缘切换"
+                                "连接后自动共享 · 从屏幕边缘切换"
+                            } else if connected {
+                                "共享已暂停，点击恢复后继续使用"
                             } else {
-                                "两端连接后，分别开启共享"
+                                "连接成功后，两端自动共享键鼠"
                             })),
                     )
                     .child(
@@ -576,8 +578,10 @@ impl Workspace {
                             .primary()
                             .label(if enabled {
                                 "暂停共享"
+                            } else if connected {
+                                "恢复共享"
                             } else {
-                                "开启共享"
+                                "连接后自动开启"
                             })
                             .disabled(!connected)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_sharing(cx))),
@@ -673,7 +677,7 @@ impl Workspace {
                         "已关闭"
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.runtime.reclaim();
+                        this.runtime.return_local();
                         this.config.keyboard = !this.config.keyboard;
                         this.runtime
                             .keyboard
@@ -698,7 +702,7 @@ impl Workspace {
     fn about(&self) -> impl IntoElement {
         card().gap_5()
             .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("一套键鼠，两台电脑。"))
-            .child(subtle("MWB Rust · 0.1.0 预览版"))
+            .child(subtle(format!("MWB Rust · {} 预览版", env!("CARGO_PKG_VERSION"))))
             .child(div().text_sm().child("以 Rust + GPUI Kit 重写 Mouse without Borders 的核心使用流程。"))
             .child(div().text_sm().child("当前支持：两台 Windows 电脑直连、密钥配对、加密键鼠传输、左右越界切换、手动发送文本剪贴板。"))
             .child(div().text_sm().child("后续计划：自动发现、多设备布局、文件传输、托盘与后台服务。"))
