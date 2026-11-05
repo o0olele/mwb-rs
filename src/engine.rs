@@ -200,7 +200,7 @@ fn run_session(
 // global hooks or moving the real desktop pointer in a test process.
 trait SessionInput {
     fn enable(&mut self, runtime: Arc<Runtime>) -> Result<()>;
-    fn enter(&mut self, from_left: bool);
+    fn enter(&mut self, from_left: bool) -> Result<()>;
     fn apply(&mut self, message: Message, keyboard: bool) -> Result<bool>;
     fn release_all(&mut self);
     fn park_cursor(&mut self);
@@ -210,8 +210,8 @@ impl SessionInput for Injector {
     fn enable(&mut self, runtime: Arc<Runtime>) -> Result<()> {
         crate::platform::install_hooks(runtime)
     }
-    fn enter(&mut self, from_left: bool) {
-        Injector::enter(self, from_left);
+    fn enter(&mut self, from_left: bool) -> Result<()> {
+        Injector::enter(self, from_left)
     }
     fn apply(&mut self, message: Message, keyboard: bool) -> Result<bool> {
         Injector::apply(self, message, keyboard)
@@ -344,7 +344,7 @@ fn session(
                         Message::Enter { from_left } if rt.enabled.load(Ordering::SeqCst) => {
                             rt.remote.store(false, Ordering::SeqCst);
                             rt.incoming.store(true, Ordering::SeqCst);
-                            injector.enter(from_left);
+                            injector.enter(from_left)?;
                         }
                         Message::Clipboard(text) if rt.enabled.load(Ordering::SeqCst) => {
                             ensure!(text.len() <= MAX_TEXT_BYTES, "剪贴板文本超过 32 KB");
@@ -404,8 +404,9 @@ mod tests {
             ensure!(!self.fail_enable, "模拟输入钩子安装失败");
             Ok(())
         }
-        fn enter(&mut self, _: bool) {
+        fn enter(&mut self, _: bool) -> Result<()> {
             self.probe.enters.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
         fn apply(&mut self, message: Message, _: bool) -> Result<bool> {
             self.probe.events.lock().unwrap().push(message);

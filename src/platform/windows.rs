@@ -1,8 +1,12 @@
-use crate::{engine::Runtime, protocol::Message};
+use crate::{
+    engine::Runtime,
+    motion::{DesktopBounds, MotionStep, PixelPoint, PointerMotion},
+    protocol::Message,
+};
 use ::windows::Win32::{
     Foundation::{LPARAM, LRESULT, POINT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
-    UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 use anyhow::{Result, bail, ensure};
 use std::{
@@ -65,9 +69,30 @@ pub fn install_hooks(runtime: Arc<Runtime>) -> Result<()> {
     rx.recv().map_err(|_| anyhow::anyhow!("输入线程启动失败"))?
 }
 
-fn desktop() -> (i32, i32, i32, i32) {
+struct PhysicalDpiScope(DPI_AWARENESS_CONTEXT);
+
+impl PhysicalDpiScope {
+    fn new() -> Self {
+        Self(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) })
+    }
+}
+
+impl Drop for PhysicalDpiScope {
+    fn drop(&mut self) {
+        if !self.0.0.is_null() {
+            unsafe {
+                SetThreadDpiAwarenessContext(self.0);
+            }
+        }
+    }
+}
+
+fn desktop() -> DesktopBounds {
+    // Low-level hook points are physical pixels. Read desktop metrics in the
+    // same coordinate space, restoring the UI thread's DPI context afterwards.
+    let _dpi = PhysicalDpiScope::new();
     unsafe {
-        (
+        DesktopBounds::new(
             GetSystemMetrics(SM_XVIRTUALSCREEN),
             GetSystemMetrics(SM_YVIRTUALSCREEN),
             GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
@@ -77,15 +102,15 @@ fn desktop() -> (i32, i32, i32, i32) {
 }
 
 pub fn park_cursor() {
-    let (x, y, w, h) = desktop();
-    let _ = move_absolute(x + w / 2, y + h / 2);
+    let bounds = desktop();
+    let _ = move_absolute(bounds, bounds.center());
 }
 
-fn move_absolute(x: i32, y: i32) -> Result<()> {
-    let (left, top, width, height) = desktop();
+fn move_absolute(bounds: DesktopBounds, point: PixelPoint) -> Result<()> {
+    let (x, y) = bounds.absolute(point);
     mouse_input(
-        ((x - left).clamp(0, width - 1) as i64 * 65535 / (width - 1) as i64) as i32,
-        ((y - top).clamp(0, height - 1) as i64 * 65535 / (height - 1) as i64) as i32,
+        x,
+        y,
         0,
         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
     )
@@ -115,9 +140,9 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
             && kind == WM_MOUSEMOVE
             && rt.edge.load(Ordering::Relaxed)
         {
-            let (left, _, width, _) = desktop();
+            let bounds = desktop();
             let right = rt.right.load(Ordering::Relaxed);
-            if ((right && event.pt.x >= left + width - 1) || (!right && event.pt.x <= left))
+            if ((right && event.pt.x >= bounds.right()) || (!right && event.pt.x <= bounds.left))
                 && rt.send(Message::Enter { from_left: right })
             {
                 rt.remote.store(true, Ordering::SeqCst);
@@ -131,13 +156,13 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         let message = match kind {
             WM_MOUSEMOVE => {
                 let mut anchor = POINT::default();
-                if GetCursorPos(&mut anchor).is_err() {
+                if GetPhysicalCursorPos(&mut anchor).is_err() {
                     rt.reclaim();
                     return CallNextHookEx(None, code, wp, lp);
                 }
                 Message::Move {
-                    dx: event.pt.x - anchor.x,
-                    dy: event.pt.y - anchor.y,
+                    dx: event.pt.x.saturating_sub(anchor.x),
+                    dy: event.pt.y.saturating_sub(anchor.y),
                 }
             }
             WM_LBUTTONDOWN | WM_LBUTTONUP => Message::Button {
@@ -298,38 +323,26 @@ fn button_input(button: u8, down: bool) -> Result<()> {
 pub struct Injector {
     keys: HashSet<(u16, u16, bool)>,
     buttons: HashSet<u8>,
-    from_left: bool,
+    motion: PointerMotion,
 }
 
 impl Injector {
-    pub fn enter(&mut self, from_left: bool) {
+    pub fn enter(&mut self, from_left: bool) -> Result<()> {
         self.release_all();
-        self.from_left = from_left;
-        let (x, y, w, h) = desktop();
-        let _ = move_absolute(if from_left { x + 4 } else { x + w - 5 }, y + h / 2);
+        let bounds = desktop();
+        let point = self.motion.enter(bounds, from_left);
+        move_absolute(bounds, point)
     }
 
     /// Returns true when the pointer crosses the edge back to its source computer.
     pub fn apply(&mut self, message: Message, keyboard: bool) -> Result<bool> {
         match message {
             Message::Move { dx, dy } => {
-                ensure!(
-                    dx.unsigned_abs() <= 32768 && dy.unsigned_abs() <= 32768,
-                    "鼠标位移无效"
-                );
-                let mut point = POINT::default();
-                unsafe {
-                    GetCursorPos(&mut point)?;
+                let bounds = desktop();
+                match self.motion.advance(bounds, dx, dy)? {
+                    MotionStep::ReturnLocal => return Ok(true),
+                    MotionStep::MoveTo(point) => move_absolute(bounds, point)?,
                 }
-                let (x, y, w, h) = desktop();
-                let next_x = point.x.saturating_add(dx);
-                if (self.from_left && next_x < x) || (!self.from_left && next_x >= x + w) {
-                    return Ok(true);
-                }
-                move_absolute(
-                    next_x.clamp(x, x + w - 1),
-                    point.y.saturating_add(dy).clamp(y, y + h - 1),
-                )?;
             }
             Message::Button { button, down } => {
                 button_input(button, down)?;
@@ -372,6 +385,9 @@ impl Injector {
     }
 
     pub fn release_all(&mut self) {
+        // Control ownership is gated by Runtime. A fresh Enter replaces the
+        // motion origin; releasing held keys must not erase a newer entry's
+        // position if a pending local-return notification is processed later.
         for (vk, scan, extended) in self.keys.drain() {
             let _ = key_input(vk, scan, extended, false);
         }
