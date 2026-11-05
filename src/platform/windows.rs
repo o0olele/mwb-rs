@@ -1,12 +1,13 @@
+use super::InputInjectionError;
 use crate::{
     engine::Runtime,
     motion::{CaptureMotion, DesktopBounds, MotionStep, PixelPoint, PointerMotion, SWITCH_DELAY},
     protocol::{Message, MouseMode},
 };
 use ::windows::Win32::{
-    Foundation::{LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{ERROR_SUCCESS, GetLastError, LPARAM, LRESULT, POINT, SetLastError, WPARAM},
     System::{
-        LibraryLoader::{GetModuleHandleW, GetProcAddress},
+        LibraryLoader::GetModuleHandleW,
         Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST},
     },
     UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
@@ -139,8 +140,10 @@ pub fn control_remote(rt: &Runtime) -> Result<()> {
     if rt.begin_control(
         primary().entry_ratio(rt.right.load(Ordering::SeqCst)),
         desktop().height_ratio(point.y),
-    ) {
-        park_cursor();
+    ) && let Err(err) = park_cursor()
+    {
+        rt.reclaim();
+        return Err(err);
     }
     Ok(())
 }
@@ -171,9 +174,9 @@ fn capture_move(rt: &Runtime, dx: i32, dy: i32) -> Result<Message> {
     })
 }
 
-pub fn park_cursor() {
+pub fn park_cursor() -> Result<()> {
     let bounds = desktop();
-    let _ = move_absolute(bounds, bounds.center());
+    move_absolute(bounds, bounds.center())
 }
 
 fn move_absolute(bounds: DesktopBounds, point: PixelPoint) -> Result<()> {
@@ -219,7 +222,10 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
                     bounds.height_ratio(event.pt.y),
                 )
             {
-                park_cursor();
+                if park_cursor().is_err() {
+                    rt.reclaim();
+                    return CallNextHookEx(None, code, wp, lp);
+                }
                 return LRESULT(1);
             }
         }
@@ -331,20 +337,18 @@ unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
     }
 }
 
-// The original probes this optional user32 export, whose signature was checked
-// against its P/Invoke declaration. Resolve by name; never require the export.
-type InjectMouse = unsafe extern "system" fn(*const MOUSEINPUT, i32) -> u32;
-
-fn native_mouse_injector() -> Option<InjectMouse> {
-    static INJECT: OnceLock<Option<InjectMouse>> = OnceLock::new();
-    *INJECT.get_or_init(|| unsafe {
-        let module = GetModuleHandleW(::windows::core::w!("user32.dll")).ok()?;
-        let proc = GetProcAddress(module, ::windows::core::s!("InjectMouseInput"))?;
-        Some(std::mem::transmute::<
-            unsafe extern "system" fn() -> isize,
-            InjectMouse,
-        >(proc))
-    })
+fn inject_input(input: INPUT, kind: &'static str) -> Result<()> {
+    // Capture the error immediately, without attributing every rejection to
+    // UIPI. Windows does not reliably report UIPI as a distinct error code.
+    unsafe {
+        SetLastError(ERROR_SUCCESS);
+    }
+    let inserted = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    if inserted != 1 {
+        let code = unsafe { GetLastError() }.0;
+        return Err(InputInjectionError::new(kind, inserted, code).into());
+    }
+    Ok(())
 }
 
 fn mouse_input(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> Result<()> {
@@ -356,19 +360,16 @@ fn mouse_input(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> Result<
         time: 0,
         dwExtraInfo: MARKER,
     };
-    let count = if flags.contains(MOUSEEVENTF_MOVE)
-        && let Some(inject) = native_mouse_injector()
-    {
-        unsafe { inject(&mouse, 1) }
-    } else {
-        let input = INPUT {
+    // The legacy private InjectMouseInput export can exist but reject the
+    // standard MOUSEINPUT ABI (observed error 87). Use the documented API for
+    // both absolute and relative motion, retaining the original coordinate modes.
+    inject_input(
+        INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 { mi: mouse },
-        };
-        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) }
-    };
-    ensure!(count == 1, "Windows 拒绝输入注入；请检查两端权限级别");
-    Ok(())
+        },
+        "鼠标",
+    )
 }
 
 fn key_input(vk: u16, scan: u16, extended: bool, down: bool) -> Result<()> {
@@ -394,11 +395,7 @@ fn key_input(vk: u16, scan: u16, extended: bool, down: bool) -> Result<()> {
             },
         },
     };
-    ensure!(
-        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } == 1,
-        "Windows 拒绝键盘输入"
-    );
-    Ok(())
+    inject_input(input, "键盘")
 }
 
 fn button_input(button: u8, down: bool) -> Result<()> {
@@ -523,5 +520,17 @@ impl Injector {
 impl Drop for Injector {
     fn drop(&mut self) {
         self.release_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; sends only a zero-distance move"]
+    fn standard_mouse_api_accepts_zero_delta() {
+        mouse_input(0, 0, 0, MOUSEEVENTF_MOVE)
+            .expect("standard SendInput zero-delta injection failed");
     }
 }

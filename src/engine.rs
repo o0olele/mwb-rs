@@ -15,7 +15,7 @@ use std::{
 use crate::{
     config::Config,
     motion::SWITCH_DELAY,
-    platform::Injector,
+    platform::{Injector, InputInjectionError},
     protocol::{MAX_TEXT_BYTES, Message, MouseMode, VERSION},
     transport,
 };
@@ -284,7 +284,9 @@ impl SessionInput for Injector {
         Injector::release_all(self);
     }
     fn park_cursor(&mut self) {
-        crate::platform::park_cursor();
+        // A peer relinquishing control must not turn a failed cosmetic warp
+        // into another input-failure notification loop.
+        let _ = crate::platform::park_cursor();
     }
 }
 
@@ -346,11 +348,11 @@ fn session(
         if rt.emergency.swap(false, Ordering::SeqCst) {
             injector.release_all();
         }
-        if rt.enabled.load(Ordering::SeqCst)
-            && rt.incoming.load(Ordering::SeqCst)
-            && let Some(y) = injector.poll_return()?
-        {
-            finish_return(rt, injector, y);
+        if rt.enabled.load(Ordering::SeqCst) && rt.incoming.load(Ordering::SeqCst) {
+            let result = injector.poll_return();
+            if let Some(Some(y)) = input_result(rt, injector, result)? {
+                finish_return(rt, injector, y);
+            }
         }
         if written == pending.len() {
             pending.clear();
@@ -418,7 +420,8 @@ fn session(
                         Message::Return { y } if rt.remote.swap(false, Ordering::SeqCst) => {
                             rt.block_switch();
                             injector.release_all();
-                            injector.return_cursor(rt.right.load(Ordering::SeqCst), y)?;
+                            let result = injector.return_cursor(rt.right.load(Ordering::SeqCst), y);
+                            input_result(rt, injector, result)?;
                         }
                         Message::Return { .. } => {}
                         Message::Enter {
@@ -430,7 +433,8 @@ fn session(
                             rt.block_switch();
                             rt.remote.store(false, Ordering::SeqCst);
                             rt.incoming.store(true, Ordering::SeqCst);
-                            injector.enter(from_left, x, y, mode)?;
+                            let result = injector.enter(from_left, x, y, mode);
+                            input_result(rt, injector, result)?;
                         }
                         Message::Clipboard(text) if rt.enabled.load(Ordering::SeqCst) => {
                             ensure!(text.len() <= MAX_TEXT_BYTES, "剪贴板文本超过 32 KB");
@@ -444,9 +448,8 @@ fn session(
                             if rt.enabled.load(Ordering::SeqCst)
                                 && rt.incoming.load(Ordering::SeqCst) =>
                         {
-                            if let Some(y) =
-                                injector.apply(other, rt.keyboard.load(Ordering::SeqCst))?
-                            {
+                            let result = injector.apply(other, rt.keyboard.load(Ordering::SeqCst));
+                            if let Some(Some(y)) = input_result(rt, injector, result)? {
                                 finish_return(rt, injector, y);
                             }
                         }
@@ -473,6 +476,23 @@ fn finish_return(rt: &Runtime, injector: &mut impl SessionInput, y: u16) {
     rt.send(Message::Return { y });
 }
 
+fn input_result<T>(
+    rt: &Runtime,
+    injector: &mut impl SessionInput,
+    result: Result<T>,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.is::<InputInjectionError>() => {
+            injector.release_all();
+            rt.reclaim();
+            rt.log(format!("输入注入失败，已暂停共享，连接保持：{err:#}"));
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +508,9 @@ mod tests {
         returns: Mutex<Vec<(bool, u16)>>,
         return_y: Mutex<Option<u16>>,
         positions: Mutex<Vec<PixelPoint>>,
+        fail_enter: AtomicBool,
+        fail_apply: AtomicBool,
+        fail_return: AtomicBool,
     }
 
     struct TestInput {
@@ -504,6 +527,9 @@ mod tests {
             Ok(())
         }
         fn enter(&mut self, from_left: bool, x: u16, y: u16, mode: MouseMode) -> Result<()> {
+            if self.probe.fail_enter.load(Ordering::SeqCst) {
+                return Err(InputInjectionError::new("鼠标", 0, 87).into());
+            }
             self.probe
                 .entries
                 .lock()
@@ -520,6 +546,9 @@ mod tests {
             Ok(())
         }
         fn apply(&mut self, message: Message, _: bool) -> Result<Option<u16>> {
+            if self.probe.fail_apply.load(Ordering::SeqCst) {
+                return Err(InputInjectionError::new("键盘", 0, 5).into());
+            }
             let result = match message {
                 Message::MoveAbsolute { x, y } => {
                     match self.motion.absolute(self.bounds, x, y, true)? {
@@ -543,6 +572,9 @@ mod tests {
             Ok(self.probe.return_y.lock().unwrap().take())
         }
         fn return_cursor(&mut self, peer_on_right: bool, y: u16) -> Result<()> {
+            if self.probe.fail_return.load(Ordering::SeqCst) {
+                return Err(InputInjectionError::new("鼠标", 0, 5).into());
+            }
             self.probe.returns.lock().unwrap().push((peer_on_right, y));
             Ok(())
         }
@@ -787,6 +819,85 @@ mod tests {
         wait_until(|| pair.b.received.load(Ordering::SeqCst) >= before + 2);
         assert_eq!(pair.b_input.enters.load(Ordering::SeqCst), 0);
         assert!(pair.b_input.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn injection_failure_pauses_sharing_keeps_connection_and_can_resume() {
+        let pair = Loopback::new(false);
+        pair.b_input.fail_enter.store(true, Ordering::SeqCst);
+        assert!(pair.a.begin_control(136, 16384));
+        wait_until(|| {
+            !pair.b.enabled.load(Ordering::SeqCst) && pair.b.snapshot().detail.contains("错误码 87")
+        });
+        wait_until(|| !pair.a.remote.load(Ordering::SeqCst));
+        assert!(pair.b.snapshot().detail.contains("已暂停共享，连接保持"));
+        assert!(pair.b.snapshot().detail.contains("错误码 87"));
+        assert!(pair.a.snapshot().connected && pair.b.snapshot().connected);
+        let received = pair.b.received.load(Ordering::SeqCst);
+        wait_until(|| pair.b.received.load(Ordering::SeqCst) > received);
+        assert!(pair.b.snapshot().connected);
+        assert!(pair.b_input.releases.load(Ordering::SeqCst) > 0);
+
+        pair.b_input.fail_enter.store(false, Ordering::SeqCst);
+        pair.b.enabled.store(true, Ordering::SeqCst);
+        wait_until(|| pair.a.can_switch());
+        assert!(pair.a.begin_control(136, 16384));
+        wait_until(|| pair.b.incoming.load(Ordering::SeqCst));
+        pair.b_input.fail_apply.store(true, Ordering::SeqCst);
+        assert!(pair.a.send(Message::Key {
+            vk: 65,
+            scan: 30,
+            extended: false,
+            down: true
+        }));
+        wait_until(|| {
+            !pair.b.enabled.load(Ordering::SeqCst) && pair.b.snapshot().detail.contains("错误码 5")
+        });
+        wait_until(|| !pair.a.remote.load(Ordering::SeqCst));
+        assert!(pair.b.snapshot().detail.contains("错误码 5"));
+        assert!(pair.a.snapshot().connected && pair.b.snapshot().connected);
+
+        pair.b_input.fail_apply.store(false, Ordering::SeqCst);
+        pair.b.enabled.store(true, Ordering::SeqCst);
+        wait_until(|| pair.a.can_switch());
+        assert!(pair.a.begin_control(136, 16384));
+        wait_until(|| pair.b.incoming.load(Ordering::SeqCst));
+        let movement = Message::MoveAbsolute { x: 20000, y: 16384 };
+        assert!(pair.a.send(movement.clone()));
+        wait_until(|| !pair.b_input.events.lock().unwrap().is_empty());
+        assert_eq!(pair.b_input.events.lock().unwrap().as_slice(), &[movement]);
+    }
+
+    #[test]
+    fn return_warp_failure_pauses_input_without_dropping_connection() {
+        let pair = Loopback::new(false);
+        pair.a_input.fail_return.store(true, Ordering::SeqCst);
+        assert!(pair.a.begin_control(136, 16384));
+        wait_until(|| pair.b.incoming.load(Ordering::SeqCst));
+        *pair.b_input.return_y.lock().unwrap() = Some(32768);
+        wait_until(|| {
+            !pair.a.enabled.load(Ordering::SeqCst)
+                && pair.a.snapshot().detail.contains("已暂停共享，连接保持")
+        });
+        assert!(pair.a.snapshot().detail.contains("已暂停共享，连接保持"));
+        assert!(pair.a.snapshot().connected && pair.b.snapshot().connected);
+        assert!(!pair.a.remote.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn malformed_mouse_input_still_ends_the_session() {
+        let pair = Loopback::new(false);
+        assert!(pair.a.begin_control(136, 16384));
+        wait_until(|| pair.b.incoming.load(Ordering::SeqCst));
+        assert!(pair.a.send(Message::MoveAbsolute {
+            x: i32::MIN,
+            y: 16384
+        }));
+        wait_until(|| {
+            !pair.b.snapshot().connected && pair.b.snapshot().detail.contains("鼠标比例坐标无效")
+        });
+        assert!(pair.b.snapshot().detail.contains("鼠标比例坐标无效"));
+        assert!(!pair.b.enabled.load(Ordering::SeqCst));
     }
 
     #[test]
