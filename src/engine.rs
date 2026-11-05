@@ -4,8 +4,8 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -14,8 +14,9 @@ use std::{
 
 use crate::{
     config::Config,
+    motion::SWITCH_DELAY,
     platform::Injector,
-    protocol::{MAX_TEXT_BYTES, Message, VERSION},
+    protocol::{MAX_TEXT_BYTES, Message, MouseMode, VERSION},
     transport,
 };
 
@@ -39,6 +40,11 @@ pub struct Runtime {
     pub keyboard: AtomicBool,
     pub edge: AtomicBool,
     pub right: AtomicBool,
+    pub relative_mouse: AtomicBool,
+    pub(crate) capture_epoch: AtomicU64,
+    pub(crate) capture_y: AtomicU16,
+    pub(crate) capture_relative: AtomicBool,
+    switch_after: AtomicU64,
     pub abort: AtomicBool,
     pub emergency: AtomicBool,
     pub sent: AtomicU64,
@@ -61,6 +67,11 @@ impl Runtime {
             keyboard: AtomicBool::new(config.keyboard),
             edge: AtomicBool::new(config.edge_switch),
             right: AtomicBool::new(config.peer_on_right),
+            relative_mouse: AtomicBool::new(config.relative_mouse),
+            capture_epoch: AtomicU64::new(0),
+            capture_y: AtomicU16::new(32768),
+            capture_relative: AtomicBool::new(false),
+            switch_after: AtomicU64::new(0),
             abort: AtomicBool::new(false),
             emergency: AtomicBool::new(false),
             sent: AtomicU64::new(0),
@@ -103,10 +114,48 @@ impl Runtime {
     }
 
     pub fn return_local(&self) {
+        self.block_switch();
         self.remote.store(false, Ordering::SeqCst);
         self.incoming.store(false, Ordering::SeqCst);
         self.emergency.store(true, Ordering::SeqCst);
         self.send(Message::Leave);
+    }
+
+    pub(crate) fn can_switch(&self) -> bool {
+        switch_tick() >= self.switch_after.load(Ordering::SeqCst)
+    }
+
+    fn block_switch(&self) {
+        self.switch_after.store(
+            switch_tick() + SWITCH_DELAY.as_millis() as u64,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub(crate) fn begin_control(&self, x: u16, y: u16) -> bool {
+        if !self.enabled.load(Ordering::SeqCst)
+            || self.incoming.load(Ordering::SeqCst)
+            || self.remote.load(Ordering::SeqCst)
+            || !self.can_switch()
+        {
+            return false;
+        }
+        let relative = self.relative_mouse.load(Ordering::SeqCst);
+        self.capture_y.store(y, Ordering::SeqCst);
+        self.capture_relative.store(relative, Ordering::SeqCst);
+        self.capture_epoch.fetch_add(1, Ordering::SeqCst);
+        self.remote.store(true, Ordering::SeqCst);
+        self.block_switch();
+        self.send(Message::Enter {
+            from_left: self.right.load(Ordering::SeqCst),
+            x,
+            y,
+            mode: if relative {
+                MouseMode::Relative
+            } else {
+                MouseMode::ScreenRelative
+            },
+        })
     }
 
     pub fn reclaim(&self) {
@@ -118,6 +167,11 @@ impl Runtime {
         self.stop.store(true, Ordering::SeqCst);
         self.reclaim();
     }
+}
+
+fn switch_tick() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 pub fn start(
@@ -200,8 +254,12 @@ fn run_session(
 // global hooks or moving the real desktop pointer in a test process.
 trait SessionInput {
     fn enable(&mut self, runtime: Arc<Runtime>) -> Result<()>;
-    fn enter(&mut self, from_left: bool) -> Result<()>;
-    fn apply(&mut self, message: Message, keyboard: bool) -> Result<bool>;
+    fn enter(&mut self, from_left: bool, x: u16, y: u16, mode: MouseMode) -> Result<()>;
+    fn apply(&mut self, message: Message, keyboard: bool) -> Result<Option<u16>>;
+    fn poll_return(&mut self) -> Result<Option<u16>> {
+        Ok(None)
+    }
+    fn return_cursor(&mut self, peer_on_right: bool, y: u16) -> Result<()>;
     fn release_all(&mut self);
     fn park_cursor(&mut self);
 }
@@ -210,11 +268,17 @@ impl SessionInput for Injector {
     fn enable(&mut self, runtime: Arc<Runtime>) -> Result<()> {
         crate::platform::install_hooks(runtime)
     }
-    fn enter(&mut self, from_left: bool) -> Result<()> {
-        Injector::enter(self, from_left)
+    fn enter(&mut self, from_left: bool, x: u16, y: u16, mode: MouseMode) -> Result<()> {
+        Injector::enter(self, from_left, x, y, mode)
     }
-    fn apply(&mut self, message: Message, keyboard: bool) -> Result<bool> {
+    fn apply(&mut self, message: Message, keyboard: bool) -> Result<Option<u16>> {
         Injector::apply(self, message, keyboard)
+    }
+    fn poll_return(&mut self) -> Result<Option<u16>> {
+        Injector::poll_return(self)
+    }
+    fn return_cursor(&mut self, peer_on_right: bool, y: u16) -> Result<()> {
+        Injector::return_cursor(self, peer_on_right, y)
     }
     fn release_all(&mut self) {
         Injector::release_all(self);
@@ -282,6 +346,12 @@ fn session(
         if rt.emergency.swap(false, Ordering::SeqCst) {
             injector.release_all();
         }
+        if rt.enabled.load(Ordering::SeqCst)
+            && rt.incoming.load(Ordering::SeqCst)
+            && let Some(y) = injector.poll_return()?
+        {
+            finish_return(rt, injector, y);
+        }
         if written == pending.len() {
             pending.clear();
             written = 0;
@@ -311,7 +381,10 @@ fn session(
                     rt.received.fetch_add(1, Ordering::Relaxed);
                     if !hello {
                         if let Message::Hello { version, name } = msg {
-                            ensure!(version == VERSION, "两端协议版本不同");
+                            ensure!(
+                                version == VERSION,
+                                "两端协议版本不同，请将两台电脑都更新到 0.2.0 或更高版本"
+                            );
                             ensure!(name.len() <= 256, "设备名称过长");
                             let input_result = injector.enable(rt.clone());
                             rt.enabled.store(input_result.is_ok(), Ordering::SeqCst);
@@ -336,15 +409,28 @@ fn session(
                         Message::Ping => {}
                         Message::Hello { .. } => bail!("重复的设备握手"),
                         Message::Leave => {
+                            rt.block_switch();
                             rt.remote.store(false, Ordering::SeqCst);
                             rt.incoming.store(false, Ordering::SeqCst);
                             injector.release_all();
                             injector.park_cursor();
                         }
-                        Message::Enter { from_left } if rt.enabled.load(Ordering::SeqCst) => {
+                        Message::Return { y } if rt.remote.swap(false, Ordering::SeqCst) => {
+                            rt.block_switch();
+                            injector.release_all();
+                            injector.return_cursor(rt.right.load(Ordering::SeqCst), y)?;
+                        }
+                        Message::Return { .. } => {}
+                        Message::Enter {
+                            from_left,
+                            x,
+                            y,
+                            mode,
+                        } if rt.enabled.load(Ordering::SeqCst) => {
+                            rt.block_switch();
                             rt.remote.store(false, Ordering::SeqCst);
                             rt.incoming.store(true, Ordering::SeqCst);
-                            injector.enter(from_left)?;
+                            injector.enter(from_left, x, y, mode)?;
                         }
                         Message::Clipboard(text) if rt.enabled.load(Ordering::SeqCst) => {
                             ensure!(text.len() <= MAX_TEXT_BYTES, "剪贴板文本超过 32 KB");
@@ -358,12 +444,11 @@ fn session(
                             if rt.enabled.load(Ordering::SeqCst)
                                 && rt.incoming.load(Ordering::SeqCst) =>
                         {
-                            if !injector.apply(other, rt.keyboard.load(Ordering::SeqCst))? {
-                                continue;
+                            if let Some(y) =
+                                injector.apply(other, rt.keyboard.load(Ordering::SeqCst))?
+                            {
+                                finish_return(rt, injector, y);
                             }
-                            injector.release_all();
-                            rt.incoming.store(false, Ordering::SeqCst);
-                            rt.send(Message::Leave);
                         }
                         _ => {}
                     }
@@ -381,9 +466,17 @@ fn session(
     Ok(())
 }
 
+fn finish_return(rt: &Runtime, injector: &mut impl SessionInput, y: u16) {
+    rt.incoming.store(false, Ordering::SeqCst);
+    rt.block_switch();
+    injector.release_all();
+    rt.send(Message::Return { y });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::motion::{CaptureMotion, DesktopBounds, MotionStep, PixelPoint, PointerMotion};
 
     #[derive(Default)]
     struct InputProbe {
@@ -391,11 +484,17 @@ mod tests {
         enters: AtomicU64,
         releases: AtomicU64,
         events: Mutex<Vec<Message>>,
+        entries: Mutex<Vec<(bool, u16, u16, MouseMode)>>,
+        returns: Mutex<Vec<(bool, u16)>>,
+        return_y: Mutex<Option<u16>>,
+        positions: Mutex<Vec<PixelPoint>>,
     }
 
     struct TestInput {
         probe: Arc<InputProbe>,
         fail_enable: bool,
+        motion: PointerMotion,
+        bounds: DesktopBounds,
     }
 
     impl SessionInput for TestInput {
@@ -404,13 +503,48 @@ mod tests {
             ensure!(!self.fail_enable, "模拟输入钩子安装失败");
             Ok(())
         }
-        fn enter(&mut self, _: bool) -> Result<()> {
+        fn enter(&mut self, from_left: bool, x: u16, y: u16, mode: MouseMode) -> Result<()> {
+            self.probe
+                .entries
+                .lock()
+                .unwrap()
+                .push((from_left, x, y, mode));
+            self.probe.positions.lock().unwrap().push(self.motion.enter(
+                self.bounds,
+                from_left,
+                y,
+                mode,
+                x,
+            ));
             self.probe.enters.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn apply(&mut self, message: Message, _: bool) -> Result<bool> {
+        fn apply(&mut self, message: Message, _: bool) -> Result<Option<u16>> {
+            let result = match message {
+                Message::MoveAbsolute { x, y } => {
+                    match self.motion.absolute(self.bounds, x, y, true)? {
+                        MotionStep::MoveTo(point) => {
+                            self.probe.positions.lock().unwrap().push(point);
+                            None
+                        }
+                        MotionStep::ReturnLocal { y } => Some(y),
+                    }
+                }
+                Message::Move { dx, dy } => {
+                    self.motion.relative(dx, dy)?;
+                    None
+                }
+                _ => None,
+            };
             self.probe.events.lock().unwrap().push(message);
-            Ok(false)
+            Ok(result)
+        }
+        fn poll_return(&mut self) -> Result<Option<u16>> {
+            Ok(self.probe.return_y.lock().unwrap().take())
+        }
+        fn return_cursor(&mut self, peer_on_right: bool, y: u16) -> Result<()> {
+            self.probe.returns.lock().unwrap().push((peer_on_right, y));
+            Ok(())
         }
         fn release_all(&mut self) {
             self.probe.releases.fetch_add(1, Ordering::SeqCst);
@@ -436,6 +570,7 @@ mod tests {
             };
             let b_config = Config {
                 name: "LAPTOP-B".into(),
+                relative_mouse: true,
                 ..Config::default()
             };
             let a = Runtime::new(&a_config);
@@ -446,6 +581,8 @@ mod tests {
             let mut a_backend = TestInput {
                 probe: a_input.clone(),
                 fail_enable: false,
+                motion: PointerMotion::default(),
+                bounds: DesktopBounds::new(0, 0, 1920, 1080),
             };
             let server = thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
@@ -462,6 +599,8 @@ mod tests {
             let mut b_backend = TestInput {
                 probe: b_input.clone(),
                 fail_enable: receiver_fails,
+                motion: PointerMotion::default(),
+                bounds: DesktopBounds::new(-3840, -1080, 3840, 2160),
             };
             let client = thread::spawn(move || {
                 let stream = TcpStream::connect(addr).unwrap();
@@ -511,6 +650,70 @@ mod tests {
         }
     }
 
+    fn enter_message(from_left: bool) -> Message {
+        Message::Enter {
+            from_left,
+            x: if from_left { 136 } else { 65364 },
+            y: 32768,
+            mode: MouseMode::Relative,
+        }
+    }
+
+    #[test]
+    fn controller_selects_mode_and_edge_return_restores_height() {
+        let pair = Loopback::new(false);
+        assert!(!pair.a.relative_mouse.load(Ordering::SeqCst));
+        assert!(pair.b.relative_mouse.load(Ordering::SeqCst));
+        assert!(pair.a.begin_control(136, 16384));
+        wait_until(|| pair.b_input.enters.load(Ordering::SeqCst) == 1);
+        assert_eq!(
+            pair.b_input.entries.lock().unwrap().as_slice(),
+            &[(true, 136, 16384, MouseMode::ScreenRelative)]
+        );
+        let mut capture = CaptureMotion::enter(
+            DesktopBounds::new(0, 0, 1920, 1080),
+            true,
+            16384,
+            MouseMode::ScreenRelative,
+        );
+        let position = capture.advance(100, 100).unwrap();
+        assert!(pair.a.send(position.clone()));
+        wait_until(|| !pair.b_input.events.lock().unwrap().is_empty());
+        assert_eq!(pair.b_input.events.lock().unwrap().as_slice(), &[position]);
+        {
+            let positions = pair.b_input.positions.lock().unwrap();
+            assert_eq!(positions[1].x - positions[0].x, 200);
+            assert_eq!(positions[1].y - positions[0].y, 200);
+        }
+        assert!(pair.a.send(Message::MoveAbsolute { x: -1, y: 49152 }));
+        wait_until(|| !pair.a_input.returns.lock().unwrap().is_empty());
+        assert_eq!(
+            pair.a_input.returns.lock().unwrap().as_slice(),
+            &[(true, 49152)]
+        );
+        assert!(!pair.a.remote.load(Ordering::SeqCst));
+        assert!(!pair.b.incoming.load(Ordering::SeqCst));
+        assert!(pair.a.enabled.load(Ordering::SeqCst));
+        assert!(!pair.a.can_switch());
+        wait_until(|| pair.a.can_switch() && pair.b.can_switch());
+        assert!(pair.b.begin_control(68, 32768));
+        wait_until(|| pair.a_input.enters.load(Ordering::SeqCst) == 1);
+        assert_eq!(
+            pair.a_input.entries.lock().unwrap().as_slice(),
+            &[(true, 68, 32768, MouseMode::Relative)]
+        );
+        let relative = Message::Move { dx: 12, dy: -5 };
+        assert!(pair.b.send(relative.clone()));
+        wait_until(|| !pair.a_input.events.lock().unwrap().is_empty());
+        assert_eq!(pair.a_input.events.lock().unwrap().as_slice(), &[relative]);
+        *pair.a_input.return_y.lock().unwrap() = Some(16384);
+        wait_until(|| !pair.b_input.returns.lock().unwrap().is_empty());
+        assert_eq!(
+            pair.b_input.returns.lock().unwrap().as_slice(),
+            &[(true, 16384)]
+        );
+    }
+
     #[test]
     fn loopback_auto_enables_both_peers_routes_mouse_and_cleans_up() {
         let mut pair = Loopback::new(false);
@@ -531,7 +734,7 @@ mod tests {
         assert!(!b.incoming.load(Ordering::SeqCst));
         assert!(pair.b_input.events.lock().unwrap().is_empty());
         a.remote.store(true, Ordering::SeqCst);
-        assert!(a.send(Message::Enter { from_left: true }));
+        assert!(a.send(enter_message(true)));
         let movement = Message::Move { dx: 15, dy: -6 };
         assert!(a.send(movement.clone()));
         wait_until(|| !pair.b_input.events.lock().unwrap().is_empty());
@@ -542,7 +745,7 @@ mod tests {
         b.return_local();
         wait_until(|| !a.remote.load(Ordering::SeqCst));
         assert!(a.enabled.load(Ordering::SeqCst) && b.enabled.load(Ordering::SeqCst));
-        assert!(a.send(Message::Enter { from_left: true }));
+        assert!(a.send(enter_message(true)));
         wait_until(|| pair.b_input.enters.load(Ordering::SeqCst) == 2);
         assert!(b.incoming.load(Ordering::SeqCst));
         pair.shutdown();
@@ -558,7 +761,7 @@ mod tests {
         let pair = Loopback::new(false);
         pair.b.reclaim();
         let before = pair.b.received.load(Ordering::SeqCst);
-        assert!(pair.a.send(Message::Enter { from_left: true }));
+        assert!(pair.a.send(enter_message(true)));
         assert!(pair.a.send(Message::Move { dx: 10, dy: 1 }));
         wait_until(|| pair.b.received.load(Ordering::SeqCst) >= before + 2);
         assert!(!pair.b.enabled.load(Ordering::SeqCst));
@@ -579,11 +782,54 @@ mod tests {
         assert!(!pair.b.enabled.load(Ordering::SeqCst));
         assert!(pair.b.snapshot().detail.contains("模拟输入钩子安装失败"));
         let before = pair.b.received.load(Ordering::SeqCst);
-        assert!(pair.a.send(Message::Enter { from_left: true }));
+        assert!(pair.a.send(enter_message(true)));
         assert!(pair.a.send(Message::Move { dx: 10, dy: 1 }));
         wait_until(|| pair.b.received.load(Ordering::SeqCst) >= before + 2);
         assert_eq!(pair.b_input.enters.load(Ordering::SeqCst), 0);
         assert!(pair.b_input.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn previous_protocol_is_rejected_before_input_is_enabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = Config::default();
+        let runtime = Runtime::new(&config);
+        let worker_runtime = runtime.clone();
+        let probe = Arc::new(InputProbe::default());
+        let mut input = TestInput {
+            probe: probe.clone(),
+            fail_enable: false,
+            motion: PointerMotion::default(),
+            bounds: DesktopBounds::new(0, 0, 1920, 1080),
+        };
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            run_session_with_input(
+                &worker_runtime,
+                stream,
+                &config,
+                &[42; 32],
+                false,
+                &mut input,
+            );
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut noise = transport::handshake(&mut stream, &[42; 32], true).unwrap();
+        let frame = transport::encode(
+            &mut noise,
+            &Message::Hello {
+                version: 1,
+                name: "old-version".into(),
+            },
+        )
+        .unwrap();
+        stream.write_all(&frame).unwrap();
+        worker.join().unwrap();
+        assert!(runtime.snapshot().detail.contains("两端协议版本不同"));
+        assert!(!runtime.snapshot().connected);
+        assert!(!runtime.enabled.load(Ordering::SeqCst));
+        assert_eq!(probe.enables.load(Ordering::SeqCst), 0);
     }
 
     #[test]

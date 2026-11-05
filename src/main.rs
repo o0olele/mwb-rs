@@ -630,13 +630,15 @@ impl Workspace {
                                 Button::new("control")
                                     .small()
                                     .label("控制对方")
-                                    .disabled(!connected || !enabled || remote)
+                                    .disabled(
+                                        !connected
+                                            || !enabled
+                                            || remote
+                                            || self.runtime.incoming.load(Ordering::SeqCst),
+                                    )
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        if this.runtime.send(Message::Enter {
-                                            from_left: this.config.peer_on_right,
-                                        }) {
-                                            this.runtime.remote.store(true, Ordering::SeqCst);
-                                            platform::park_cursor();
+                                        if let Err(err) = platform::control_remote(&this.runtime) {
+                                            this.notice = format!("无法切换控制：{err:#}");
                                         }
                                         cx.notify();
                                     })),
@@ -649,6 +651,27 @@ impl Workspace {
         card()
             .gap_5()
             .child(div().font_weight(FontWeight::SEMIBOLD).child("共享偏好"))
+            .child(option_row(
+                "相对移动鼠标",
+                "默认按屏幕比例移动；开启后使用原生相对移动。更改后从边缘重新切换。",
+                Button::new("relative-mouse-toggle")
+                    .label(if self.config.relative_mouse {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.runtime.snapshot().connected {
+                            this.runtime.return_local();
+                        }
+                        this.config.relative_mouse = !this.config.relative_mouse;
+                        this.runtime
+                            .relative_mouse
+                            .store(this.config.relative_mouse, Ordering::SeqCst);
+                        this.persist();
+                        cx.notify();
+                    })),
+            ))
             .child(option_row(
                 "从屏幕边缘切换",
                 "鼠标跨过设备相邻的屏幕边缘时，将控制权交给对方。",
@@ -704,7 +727,7 @@ impl Workspace {
             .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("一套键鼠，两台电脑。"))
             .child(subtle(format!("MWB Rust · {} 预览版", env!("CARGO_PKG_VERSION"))))
             .child(div().text_sm().child("以 Rust + GPUI Kit 重写 Mouse without Borders 的核心使用流程。"))
-            .child(div().text_sm().child("当前支持：两台 Windows 电脑直连、密钥配对、加密键鼠传输、左右越界切换、手动发送文本剪贴板。"))
+            .child(div().text_sm().child("当前支持：两台 Windows 电脑直连、屏幕比例 / 相对鼠标移动、密钥配对、加密键鼠传输、左右越界切换、手动发送文本剪贴板。"))
             .child(div().text_sm().child("后续计划：自动发现、多设备布局、文件传输、托盘与后台服务。"))
             .child(div().text_sm().child("两端均需运行本重写版。普通用户权限下运行，当前不支持 UAC 安全桌面。"))
             .child(div().text_xs().text_color(rgb(MUTED)).child("Native UI · GPUI Kit 0.8.1  /  Transport · Noise + ChaCha20-Poly1305"))

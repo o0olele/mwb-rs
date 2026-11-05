@@ -1,6 +1,6 @@
 [package]
 name = "mwb"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "A Windows-first keyboard and mouse sharing app built with Rust and GPUI Kit"
 license = "MIT"
@@ -21,7 +21,7 @@ arboard = { version = "3", default-features = false }
 gpui-kit = { version = "=0.8.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_System_LibraryLoader"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
 
 [[bin]]
 name = "mwb"

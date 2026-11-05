@@ -12,6 +12,7 @@ pub struct Config {
     pub peer_on_right: bool,
     pub edge_switch: bool,
     pub keyboard: bool,
+    pub relative_mouse: bool,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             peer_on_right: true,
             edge_switch: true,
             keyboard: true,
+            relative_mouse: false,
         }
     }
 }
@@ -113,6 +115,21 @@ pub fn parse_pairing_key(value: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_settings_default_to_screen_relative_motion() {
+        let config: Config = serde_json::from_str(r#"{"port":24810,"keyboard":false}"#).unwrap();
+        assert!(!config.relative_mouse);
+        assert!(!config.keyboard);
+        let mut config = config;
+        config.relative_mouse = true;
+        let saved = serde_json::to_vec(&config).unwrap();
+        assert!(
+            serde_json::from_slice::<Config>(&saved)
+                .unwrap()
+                .relative_mouse
+        );
+    }
 
     #[test]
     fn default_keys_remain_random_64_digit_hex() {

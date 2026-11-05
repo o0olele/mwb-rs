@@ -1,15 +1,19 @@
 use crate::{
     engine::Runtime,
-    motion::{DesktopBounds, MotionStep, PixelPoint, PointerMotion},
-    protocol::Message,
+    motion::{CaptureMotion, DesktopBounds, MotionStep, PixelPoint, PointerMotion, SWITCH_DELAY},
+    protocol::{Message, MouseMode},
 };
 use ::windows::Win32::{
     Foundation::{LPARAM, LRESULT, POINT, WPARAM},
-    System::LibraryLoader::GetModuleHandleW,
+    System::{
+        LibraryLoader::{GetModuleHandleW, GetProcAddress},
+        Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST},
+    },
     UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 use anyhow::{Result, bail, ensure};
 use std::{
+    cell::RefCell,
     collections::HashSet,
     mem::size_of,
     sync::{
@@ -18,6 +22,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::Instant,
 };
 
 const MARKER: usize = 0x4D574252;
@@ -26,6 +31,9 @@ static HOOKS_READY: AtomicBool = AtomicBool::new(false);
 // Suppressed keystrokes do not update GetAsyncKeyState. Track physical modifiers
 // here so the emergency chord also works while keyboard forwarding is active.
 static MODIFIERS: AtomicU8 = AtomicU8::new(0);
+thread_local! {
+    static CAPTURE: RefCell<Option<(u64, CaptureMotion)>> = const { RefCell::new(None) };
+}
 
 pub fn install_hooks(runtime: Arc<Runtime>) -> Result<()> {
     if HOOKS_READY.load(Ordering::SeqCst) {
@@ -34,6 +42,7 @@ pub fn install_hooks(runtime: Arc<Runtime>) -> Result<()> {
     RUNTIME.get_or_init(|| runtime);
     let (tx, rx) = mpsc::sync_channel(1);
     thread::spawn(move || unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         let result = (|| -> Result<_> {
             let module = GetModuleHandleW(None)?;
             let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), Some(module.into()), 0)?;
@@ -101,6 +110,67 @@ fn desktop() -> DesktopBounds {
     }
 }
 
+fn primary() -> DesktopBounds {
+    let _dpi = PhysicalDpiScope::new();
+    unsafe {
+        DesktopBounds::new(
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN),
+        )
+    }
+}
+
+fn cursor_position() -> Result<PixelPoint> {
+    let mut point = POINT::default();
+    unsafe {
+        GetPhysicalCursorPos(&mut point)?;
+    }
+    Ok(PixelPoint {
+        x: point.x,
+        y: point.y,
+    })
+}
+
+pub fn control_remote(rt: &Runtime) -> Result<()> {
+    ensure!(rt.enabled.load(Ordering::SeqCst), "请先连接并开启共享");
+    let point = cursor_position()?;
+    if rt.begin_control(
+        primary().entry_ratio(rt.right.load(Ordering::SeqCst)),
+        desktop().height_ratio(point.y),
+    ) {
+        park_cursor();
+    }
+    Ok(())
+}
+
+fn capture_move(rt: &Runtime, dx: i32, dy: i32) -> Result<Message> {
+    CAPTURE.with_borrow_mut(|capture| {
+        let epoch = rt.capture_epoch.load(Ordering::SeqCst);
+        if capture.as_ref().is_none_or(|(old, _)| *old != epoch) {
+            *capture = Some((
+                epoch,
+                CaptureMotion::enter(
+                    primary(),
+                    rt.right.load(Ordering::SeqCst),
+                    rt.capture_y.load(Ordering::SeqCst),
+                    if rt.capture_relative.load(Ordering::SeqCst) {
+                        MouseMode::Relative
+                    } else {
+                        MouseMode::ScreenRelative
+                    },
+                ),
+            ));
+        }
+        capture
+            .as_mut()
+            .expect("initialized capture")
+            .1
+            .advance(dx, dy)
+    })
+}
+
 pub fn park_cursor() {
     let bounds = desktop();
     let _ = move_absolute(bounds, bounds.center());
@@ -139,13 +209,16 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         if !rt.remote.load(Ordering::Relaxed)
             && kind == WM_MOUSEMOVE
             && rt.edge.load(Ordering::Relaxed)
+            && rt.can_switch()
         {
             let bounds = desktop();
             let right = rt.right.load(Ordering::Relaxed);
             if ((right && event.pt.x >= bounds.right()) || (!right && event.pt.x <= bounds.left))
-                && rt.send(Message::Enter { from_left: right })
+                && rt.begin_control(
+                    primary().entry_ratio(right),
+                    bounds.height_ratio(event.pt.y),
+                )
             {
-                rt.remote.store(true, Ordering::SeqCst);
                 park_cursor();
                 return LRESULT(1);
             }
@@ -160,9 +233,16 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
                     rt.reclaim();
                     return CallNextHookEx(None, code, wp, lp);
                 }
-                Message::Move {
-                    dx: event.pt.x.saturating_sub(anchor.x),
-                    dy: event.pt.y.saturating_sub(anchor.y),
+                match capture_move(
+                    rt,
+                    event.pt.x.saturating_sub(anchor.x),
+                    event.pt.y.saturating_sub(anchor.y),
+                ) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        rt.reclaim();
+                        return CallNextHookEx(None, code, wp, lp);
+                    }
                 }
             }
             WM_LBUTTONDOWN | WM_LBUTTONUP => Message::Button {
@@ -251,24 +331,43 @@ unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
     }
 }
 
+// The original probes this optional user32 export, whose signature was checked
+// against its P/Invoke declaration. Resolve by name; never require the export.
+type InjectMouse = unsafe extern "system" fn(*const MOUSEINPUT, i32) -> u32;
+
+fn native_mouse_injector() -> Option<InjectMouse> {
+    static INJECT: OnceLock<Option<InjectMouse>> = OnceLock::new();
+    *INJECT.get_or_init(|| unsafe {
+        let module = GetModuleHandleW(::windows::core::w!("user32.dll")).ok()?;
+        let proc = GetProcAddress(module, ::windows::core::s!("InjectMouseInput"))?;
+        Some(std::mem::transmute::<
+            unsafe extern "system" fn() -> isize,
+            InjectMouse,
+        >(proc))
+    })
+}
+
 fn mouse_input(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> Result<()> {
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx,
-                dy,
-                mouseData: data,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: MARKER,
-            },
-        },
+    let mouse = MOUSEINPUT {
+        dx,
+        dy,
+        mouseData: data,
+        dwFlags: flags,
+        time: 0,
+        dwExtraInfo: MARKER,
     };
-    ensure!(
-        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } == 1,
-        "Windows 拒绝输入注入；请检查两端权限级别"
-    );
+    let count = if flags.contains(MOUSEEVENTF_MOVE)
+        && let Some(inject) = native_mouse_injector()
+    {
+        unsafe { inject(&mouse, 1) }
+    } else {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 { mi: mouse },
+        };
+        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) }
+    };
+    ensure!(count == 1, "Windows 拒绝输入注入；请检查两端权限级别");
     Ok(())
 }
 
@@ -324,23 +423,47 @@ pub struct Injector {
     keys: HashSet<(u16, u16, bool)>,
     buttons: HashSet<u8>,
     motion: PointerMotion,
+    entered_at: Option<Instant>,
 }
 
 impl Injector {
-    pub fn enter(&mut self, from_left: bool) -> Result<()> {
+    pub fn enter(&mut self, from_left: bool, x: u16, y: u16, mode: MouseMode) -> Result<()> {
         self.release_all();
         let bounds = desktop();
-        let point = self.motion.enter(bounds, from_left);
+        let point = self.motion.enter(bounds, from_left, y, mode, x);
+        self.entered_at = Some(Instant::now());
         move_absolute(bounds, point)
     }
 
-    /// Returns true when the pointer crosses the edge back to its source computer.
-    pub fn apply(&mut self, message: Message, keyboard: bool) -> Result<bool> {
+    pub fn return_cursor(&mut self, peer_on_right: bool, y: u16) -> Result<()> {
+        let bounds = desktop();
+        move_absolute(bounds, bounds.entry(!peer_on_right, y))
+    }
+
+    fn can_return(&self) -> bool {
+        self.entered_at
+            .is_some_and(|entered| entered.elapsed() >= SWITCH_DELAY)
+    }
+
+    pub fn poll_return(&self) -> Result<Option<u16>> {
+        if self.motion.is_relative() && self.can_return() {
+            Ok(self.motion.observe(desktop(), cursor_position()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Returns the crossing height when control should return to the source PC.
+    pub fn apply(&mut self, message: Message, keyboard: bool) -> Result<Option<u16>> {
         match message {
             Message::Move { dx, dy } => {
+                self.motion.relative(dx, dy)?;
+                mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE)?;
+            }
+            Message::MoveAbsolute { x, y } => {
                 let bounds = desktop();
-                match self.motion.advance(bounds, dx, dy)? {
-                    MotionStep::ReturnLocal => return Ok(true),
+                match self.motion.absolute(bounds, x, y, self.can_return())? {
+                    MotionStep::ReturnLocal { y } => return Ok(Some(y)),
                     MotionStep::MoveTo(point) => move_absolute(bounds, point)?,
                 }
             }
@@ -381,7 +504,7 @@ impl Injector {
             }
             _ => {}
         }
-        Ok(false)
+        Ok(None)
     }
 
     pub fn release_all(&mut self) {

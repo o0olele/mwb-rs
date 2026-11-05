@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_TEXT_BYTES: usize = 32 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MouseMode {
+    #[default]
+    ScreenRelative,
+    Relative,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Message {
@@ -12,8 +19,18 @@ pub enum Message {
     Ping,
     Enter {
         from_left: bool,
+        x: u16,
+        y: u16,
+        mode: MouseMode,
     },
     Leave,
+    Return {
+        y: u16,
+    },
+    MoveAbsolute {
+        x: i32,
+        y: i32,
+    },
     Move {
         dx: i32,
         dy: i32,
