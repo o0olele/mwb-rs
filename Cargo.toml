@@ -2,6 +2,8 @@
 name = "mwb"
 version = "0.5.0"
 edition = "2024"
+rust-version = "1.95"
+default-run = "mwb"
 description = "A Windows-first keyboard and mouse sharing app built with Rust and GPUI Kit"
 license = "MIT"
 
@@ -23,12 +25,16 @@ gpui-kit = { version = "=0.8.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.61"
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_System_DataExchange", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Memory", "Win32_System_SystemServices", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_System_DataExchange", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Memory", "Win32_System_SystemServices", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security", "Win32_Security_Authorization", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_System_Services", "Win32_System_StationsAndDesktops", "Win32_System_JobObjects"] }
 
 [[bin]]
 name = "mwb"
 path = "src/main.rs"
 required-features = ["desktop"]
+
+[[bin]]
+name = "mwb-input-service"
+path = "src/bin/input-service.rs"
 
 [dev-dependencies]
 tempfile = "3"

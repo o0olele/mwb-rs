@@ -42,3 +42,21 @@ impl fmt::Display for InputInjectionError {
 }
 
 impl Error for InputInjectionError {}
+
+#[derive(Debug)]
+pub(crate) struct InputServiceError(pub String);
+impl fmt::Display for InputServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl Error for InputServiceError {}
+
+#[derive(Debug)]
+pub(crate) struct LocalInputTakeover;
+impl fmt::Display for LocalInputTakeover {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("被控端的本地键鼠已接管")
+    }
+}
+impl Error for LocalInputTakeover {}

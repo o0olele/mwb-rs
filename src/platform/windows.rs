@@ -1,4 +1,4 @@
-use super::InputInjectionError;
+use super::{InputInjectionError, InputServiceError};
 use crate::{
     engine::Runtime,
     layout::{DeviceInfo, Point, Rect, Screen},
@@ -10,7 +10,10 @@ use ::windows::Win32::{
     Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW},
     System::{
         LibraryLoader::GetModuleHandleW,
-        Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST},
+        StationsAndDesktops::{GetThreadDesktop, GetUserObjectInformationW, UOI_IO},
+        Threading::{
+            GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+        },
     },
     UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
@@ -188,6 +191,16 @@ pub fn cursor_position() -> Result<Point> {
 }
 pub fn park_cursor() -> Result<()> {
     move_absolute(desktop(), primary().center())
+}
+
+/// Authenticate the installed broker without installing hooks or injecting input.
+pub fn input_service_ready() -> Result<bool> {
+    if let Some(mut client) = crate::input_service::Client::connect()? {
+        client.release();
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 fn move_absolute(bounds: Rect, point: Point) -> Result<()> {
     let (x, y) = motion::absolute(bounds, point);
@@ -432,11 +445,76 @@ fn button_input(button: u8, down: bool) -> Result<()> {
 
 #[derive(Default)]
 pub struct Injector {
+    native: NativeInjector,
+    service: Option<crate::input_service::Client>,
+}
+
+impl Injector {
+    pub fn enter_at(&mut self, point: Point, mode: MouseMode) -> Result<()> {
+        self.release_all();
+        self.service = crate::input_service::Client::connect()
+            .map_err(|e| InputServiceError(format!("锁屏输入服务连接失败：{e:#}")))?;
+        if let Some(service) = self.service.as_mut() {
+            service.enter(point, mode)
+        } else {
+            let mut active = ::windows::core::BOOL::default();
+            let accessible = unsafe {
+                GetThreadDesktop(GetCurrentThreadId()).is_ok_and(|desktop| {
+                    GetUserObjectInformationW(
+                        ::windows::Win32::Foundation::HANDLE(desktop.0),
+                        UOI_IO,
+                        Some((&mut active as *mut ::windows::core::BOOL).cast()),
+                        size_of::<::windows::core::BOOL>() as u32,
+                        None,
+                    )
+                    .is_ok()
+                        && active.as_bool()
+                })
+            };
+            if !accessible {
+                return Err(InputServiceError(
+                    "当前桌面不可访问；锁屏控制需要在被控端安装输入服务，并运行安装目录中的 MWB"
+                        .into(),
+                )
+                .into());
+            }
+            self.native.enter_at(point, mode)
+        }
+    }
+    pub fn apply_event(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
+        if let Some(service) = self.service.as_mut() {
+            service.apply(event, keyboard)
+        } else {
+            self.native.apply_event(event, keyboard)
+        }
+    }
+    pub fn position(&mut self) -> Result<Point> {
+        if let Some(service) = self.service.as_mut() {
+            service.position()
+        } else {
+            cursor_position()
+        }
+    }
+    pub fn release_all(&mut self) {
+        if let Some(mut service) = self.service.take() {
+            service.release();
+        }
+        self.native.release_all();
+    }
+}
+impl Drop for Injector {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct NativeInjector {
     keys: HashSet<(u16, u16, bool)>,
     buttons: HashSet<u8>,
     mode: Option<MouseMode>,
 }
-impl Injector {
+impl NativeInjector {
     pub fn enter_at(&mut self, point: Point, mode: MouseMode) -> Result<()> {
         self.release_all();
         self.mode = Some(mode);
@@ -517,7 +595,7 @@ impl Injector {
     }
 }
 
-impl Drop for Injector {
+impl Drop for NativeInjector {
     fn drop(&mut self) {
         self.release_all();
     }

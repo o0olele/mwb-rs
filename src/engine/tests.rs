@@ -24,6 +24,8 @@ struct Probe {
     fail_enter: AtomicBool,
     fail_apply: AtomicBool,
     fail_clipboard: AtomicBool,
+    fail_service: AtomicBool,
+    service_takeover: AtomicBool,
 }
 struct FakeInput {
     probe: Arc<Probe>,
@@ -87,6 +89,12 @@ impl SessionInput for FakeInput {
         Ok(())
     }
     fn position(&mut self) -> Result<Point> {
+        if self.probe.fail_service.load(Ordering::SeqCst) {
+            return Err(InputServiceError("模拟锁屏输入服务断开".into()).into());
+        }
+        if self.probe.service_takeover.swap(false, Ordering::SeqCst) {
+            return Err(LocalInputTakeover.into());
+        }
         Ok(*self.probe.point.lock().unwrap())
     }
     fn release_all(&mut self) {
@@ -515,6 +523,35 @@ fn injection_failure_pauses_only_target_preserves_links_and_can_resume() {
     c.key(1, 65);
     wait(|| c.nodes[2].snapshot().detail.contains("错误码 5"));
     assert!(c.nodes[2].snapshot().connected);
+}
+
+#[test]
+fn service_takeover_and_loss_release_input_in_both_mouse_modes_without_dropping_links() {
+    for relative in [false, true] {
+        let c = Cluster::new(3);
+        c.nodes[1].relative_mouse.store(relative, Ordering::SeqCst);
+        c.control(1, 2);
+        c.key(1, 65);
+        wait(|| c.probes[2].held.lock().unwrap().contains(&65));
+        c.probes[2].service_takeover.store(true, Ordering::SeqCst);
+        wait(|| c.nodes[0].snapshot().control.is_none());
+        assert!(c.probes[2].held.lock().unwrap().is_empty());
+        assert!(c.nodes.iter().all(|node| node.sharing_enabled()));
+        c.control(1, 2);
+        c.key(1, 66);
+        wait(|| c.probes[2].held.lock().unwrap().contains(&66));
+        c.probes[2].fail_service.store(true, Ordering::SeqCst);
+        wait(|| c.nodes[0].snapshot().control.is_none());
+        assert!(c.nodes.iter().all(|node| node.snapshot().connected));
+        assert!(c.probes[2].held.lock().unwrap().is_empty());
+        assert!(!c.nodes[2].sharing_enabled());
+        assert!(c.nodes[1].sharing_enabled());
+        c.probes[2].fail_service.store(false, Ordering::SeqCst);
+        c.nodes[2].resume().unwrap();
+        c.control(1, 2);
+        c.key(1, 67);
+        wait(|| c.probes[2].held.lock().unwrap().contains(&67));
+    }
 }
 #[test]
 fn targeted_clipboard_failure_keeps_keyboard_links_alive() {

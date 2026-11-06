@@ -1375,8 +1375,9 @@ impl Workspace {
             .child(subtle(format!("MWB Rust · {} 预览版", env!("CARGO_PKG_VERSION"))))
             .child(div().text_sm().child("以 Rust + GPUI Kit 重写 Mouse without Borders 的核心使用流程。"))
             .child(div().text_sm().child("当前支持：多设备工作组、自由屏幕布局、键鼠共享、自动文本/图片剪贴板、跨设备 Ctrl+V 粘贴文件与不限大小的文件传输。"))
-            .child(div().text_sm().child("后续计划：文件夹传输、断点续传、自动发现、托盘与后台服务。"))
-            .child(div().text_sm().child("两端均需运行本重写版。普通用户权限下运行，当前不支持 UAC 安全桌面。"))
+            .child(div().text_sm().child("接收端可选安装锁屏输入服务，允许从其他电脑操作锁屏界面；安装方法见 README。控制端需保持解锁。"))
+            .child(div().text_sm().child("后续计划：文件夹传输、断点续传、自动发现与托盘。"))
+            .child(div().text_sm().child("两端均需运行本重写版。首次登录后先打开程序并连接工作组；暂不提供远程 Ctrl+Alt+Delete。"))
             .child(div().text_xs().text_color(rgb(MUTED)).child("Native UI · GPUI Kit 0.8.1  /  Transport · Noise + ChaCha20-Poly1305"))
     }
 }
@@ -1589,6 +1590,19 @@ fn option_row(title: &'static str, desc: &'static str, control: impl IntoElement
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--check-input-service") {
+        // A deployment smoke check that never opens a window, installs a hook,
+        // injects input or touches the clipboard. Read the exit code from the
+        // launching process because the release binary has no console window.
+        std::process::exit(match platform::input_service_ready() {
+            Ok(true) => 0,
+            Ok(false) => 2,
+            Err(error) => {
+                eprintln!("{error:#}");
+                3
+            }
+        });
+    }
     gpui_kit::application()
         .with_assets(assets::AllAssets)
         .run(|cx| {

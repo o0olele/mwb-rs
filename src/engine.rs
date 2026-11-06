@@ -7,7 +7,7 @@ use crate::{
     layout::{DeviceInfo, Layout, Placement, Point},
     motion::{RemoteMotion, SWITCH_DELAY},
     network::{self, Event, Link},
-    platform::{self, InputInjectionError},
+    platform::{self, InputInjectionError, InputServiceError, LocalInputTakeover},
     protocol::{Control, InputEvent, Message, MouseMode},
 };
 use anyhow::{Result, bail, ensure};
@@ -161,6 +161,15 @@ impl Runtime {
         self.enabled.store(false, Ordering::SeqCst);
         self.return_local();
     }
+    fn input_failure(&self, error: &anyhow::Error) {
+        if error.is::<LocalInputTakeover>() {
+            self.return_local();
+            self.log("被控端的本地键鼠已接管，可再次切入");
+        } else {
+            self.reclaim();
+            self.log(format!("输入注入失败，连接保持：{error:#}"));
+        }
+    }
     pub fn resume(&self) -> Result<()> {
         ensure!(
             self.snapshot().connected && !self.stop.load(Ordering::SeqCst),
@@ -282,7 +291,7 @@ impl SessionInput for platform::Injector {
         self.apply_event(e, k)
     }
     fn position(&mut self) -> Result<Point> {
-        platform::cursor_position()
+        platform::Injector::position(self)
     }
     fn release_all(&mut self) {
         platform::Injector::release_all(self)
@@ -386,11 +395,9 @@ fn start_with_input(
                 && group.last_cursor.elapsed() >= Duration::from_millis(8)
             {
                 group.last_cursor = Instant::now();
-                if let Some(c) = group.control.clone()
-                    && c.mode == MouseMode::Relative
-                {
+                if let Some(c) = group.control.clone() {
                     match input.position() {
-                        Ok(point) => {
+                        Ok(point) if c.mode == MouseMode::Relative => {
                             let _ = group.submit(
                                 Message::Cursor {
                                     epoch: c.epoch,
@@ -399,9 +406,10 @@ fn start_with_input(
                                 &mut input,
                             );
                         }
+                        Ok(_) => {}
                         Err(e) => {
-                            rt.reclaim();
-                            rt.log(format!("读取光标失败，已暂停共享：{e:#}"));
+                            input.release_all();
+                            rt.input_failure(&e);
                         }
                     }
                 }
@@ -815,8 +823,8 @@ impl Group {
         // Central epochs serialize competing controllers and reject stale input.
         self.broadcast(Message::Control(control.clone()));
         if let Err(e) = self.apply_control(control, input) {
-            self.rt.reclaim();
-            self.rt.log(format!("输入定位失败，已暂停共享：{e:#}"));
+            input.release_all();
+            self.rt.input_failure(&e);
         }
     }
     fn apply_control(
@@ -888,10 +896,12 @@ impl Group {
             }
             Message::Control(c) => {
                 if let Err(e) = self.apply_control(c, input) {
-                    if e.is::<InputInjectionError>() {
+                    if e.is::<InputInjectionError>()
+                        || e.is::<InputServiceError>()
+                        || e.is::<LocalInputTakeover>()
+                    {
                         input.release_all();
-                        self.rt.reclaim();
-                        self.rt.log(format!("输入注入失败，连接保持：{e:#}"));
+                        self.rt.input_failure(&e);
                     } else {
                         return Err(e);
                     }
@@ -906,10 +916,12 @@ impl Group {
                         .is_some_and(|c| c.epoch == epoch && c.target == self.rt.local.id)
                     && let Err(e) = input.apply(event, self.rt.keyboard.load(Ordering::SeqCst))
                 {
-                    if e.is::<InputInjectionError>() {
+                    if e.is::<InputInjectionError>()
+                        || e.is::<InputServiceError>()
+                        || e.is::<LocalInputTakeover>()
+                    {
                         input.release_all();
-                        self.rt.reclaim();
-                        self.rt.log(format!("输入注入失败，连接保持：{e:#}"));
+                        self.rt.input_failure(&e);
                     } else {
                         return Err(e);
                     }

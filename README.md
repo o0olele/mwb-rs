@@ -66,9 +66,28 @@ Rust + GPUI Kit Windows 多设备键鼠共享工具。
 
 设备标识、已保存布局、偏好、限速、接收文件夹和中心地址保存在 %LOCALAPPDATA%\MWB-Rust\settings.json。每台设备生成独立标识，**不要复制整份配置到其他电脑**。旧左右配置不再约束自由布局。开发可用 MWB_CONFIG_DIR 指定隔离目录。
 
+## 锁屏控制（可选接收端服务）
+
+要从另一台电脑把鼠标切入被控端的 Windows 锁屏界面，并输入密码或 PIN，需要在**被控端**安装输入服务。控制端保持解锁。先构建，再在被控端的**管理员 PowerShell** 中执行：
+
+    cargo build --release --locked
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\input-service.ps1 -Action Install
+
+安装后打开 **`C:\Program Files\MWB-Rust\mwb.exe`**（以实际 Program Files 目录为准），输入配对密钥并创建或加入工作组，然后再锁屏。必须运行安装目录里的程序；服务会校验客户端路径和登录会话。更新时先关闭已安装的 MWB 窗口，再重新执行安装脚本。
+
+服务只处理接收的键鼠输入，不保存配对密钥、不处理剪贴板或文件，也不自动打开主程序；重启后仍需先登录、运行程序并连接工作组。服务中断会释放控制并保留网络连接，恢复服务后在被控端重新开启共享。卸载使用同一脚本的 `-Action Uninstall`，保留用户配置和接收文件。
+
+尚未完成两台实体电脑的锁屏登录验收；自动测试覆盖桌面切换状态、输入服务通信、按键释放和故障恢复。完整安装、诊断、权限范围与验收步骤见 [锁屏输入服务](docs/input-service.md)。
+
 ## 构建与验证
 
-Windows 10/11，Rust MSVC 工具链、Visual Studio C++ Build Tools、Windows SDK 和 CMake。GPUI Kit 固定为 0.8.1。
+Windows 10/11，Rust **1.95.0 或更新版本**的 MSVC 工具链、Visual Studio C++ Build Tools、Windows SDK 和 CMake。GPUI Kit 固定为 0.8.1，其依赖 `gpui-pre 0.3.10` 使用的 `std::hint::cold_path()` 从 Rust 1.95.0 起稳定；旧版 Rust 会报 `E0658`。
+
+仓库通过 `rust-toolchain.toml` 固定使用 Rust 1.95.0。使用 rustup 时，在项目目录运行以下命令会自动选择该工具链，无需修改全局默认版本。首次构建可先安装：
+
+    rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+
+在项目目录确认 `rustc --version` 显示 1.95.0，然后构建与验证：
 
     cargo run --locked
     cargo fmt --all -- --check
@@ -76,7 +95,7 @@ Windows 10/11，Rust MSVC 工具链、Visual Studio C++ Build Tools、Windows SD
     cargo clippy --all-targets --locked -- -D warnings
     cargo build --release --locked
 
-发布输出为 target\release\mwb.exe。测试使用真实 TCP + Noise 和替代输入后端，验证三设备路由、连续跨设备切换、布局同步/冲突、旧会话事件隔离、竞争控制、断线重连、暂停保留及故障恢复，不安装钩子、不移动真实光标、不修改真实剪贴板。
+发布输出为 target\release\mwb.exe 和可选的 target\release\mwb-input-service.exe。测试使用真实 TCP + Noise 和替代输入后端，验证三设备路由、连续跨设备切换、布局同步/冲突、旧会话事件隔离、竞争控制、断线重连、暂停保留及故障恢复，不安装钩子、不移动真实光标、不修改真实剪贴板。
 
 文件和剪贴板测试覆盖文本/图像防回环、重连版本、旧内容竞争、按需粘贴、多文件、缓存复用、取消重试、中断清理、源文件变更、同名保护、校验和限速期间的输入响应。原生 COM 测试验证格式枚举、Unicode/64 位描述符、跨线程封送、读取、Seek、Clone 和 EOF。大文件和 Windows Shell 接收测试需单独运行：
 
@@ -90,6 +109,6 @@ Windows Shell 测试直接把原生数据对象交给测试目录的接收接口
 
 ## 当前边界
 
-尚无自动发现、密钥持久化、文件夹传输、断点续传、跨设备直接拖放、托盘、自启动、服务及 UAC 安全桌面。中心离线时暂停远控，尚无自动中心选举。画布不改变单机内部 Windows 显示设置。最多保存 16 台设备，暂未提供离线设备删除界面。所有注入使用标准 SendInput，遵循 Windows 权限限制。
+尚无自动发现、密钥持久化、文件夹传输、断点续传、跨设备直接拖放、托盘及主程序自启动。可选服务仅支持当前物理控制台会话的接收端输入，不支持锁屏控制端捕获、首次登录前配对、RDP 会话或远程 Ctrl+Alt+Delete；UAC、多用户切换及复杂多屏仍需实机验收。中心离线时暂停远控，尚无自动中心选举。画布不改变单机内部 Windows 显示设置。最多保存 16 台设备，暂未提供离线设备删除界面。所有注入使用标准 SendInput。
 
 结构与对照：[剪贴板与文件设计](docs/clipboard-files.md)、[自由布局与工作组设计](docs/free-layout.md)、[鼠标输入设计](docs/mouse-input.md)、[原版逆向差距](docs/implementation-gap.md)。
