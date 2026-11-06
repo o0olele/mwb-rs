@@ -6,10 +6,11 @@ use std::{fs, path::PathBuf};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub device_id: String,
+    pub layout: crate::layout::Layout,
     pub name: String,
     pub peer_address: String,
     pub port: u16,
-    pub peer_on_right: bool,
     pub edge_switch: bool,
     pub keyboard: bool,
     pub relative_mouse: bool,
@@ -20,10 +21,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            device_id: new_device_id(),
+            layout: crate::layout::Layout::default(),
             name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "My PC".into()),
             peer_address: String::new(),
             port: 24810,
-            peer_on_right: true,
             edge_switch: true,
             keyboard: true,
             relative_mouse: false,
@@ -64,6 +66,12 @@ impl Config {
 }
 
 pub const MAX_PAIRING_KEY_CHARS: usize = 64;
+
+fn new_device_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("Windows secure random source unavailable");
+    hex::encode(bytes)
+}
 
 // Fixed protocol domain salt: peers derive the same PSK without transmitting the
 // passphrase. This is not a PAKE; short secrets remain vulnerable to guessing.
@@ -119,6 +127,21 @@ pub fn parse_pairing_key(value: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_identity_and_free_positions_survive_settings_roundtrip() {
+        let mut config = Config::default();
+        let mut info = crate::layout::test_device(1, 3840, 2160);
+        info.id = config.device_id.clone();
+        config.layout.upsert(info, true).unwrap();
+        config.layout.devices[0].x = -2471;
+        config.layout.devices[0].y = 369;
+        let restored: Config =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(restored.device_id, config.device_id);
+        assert_eq!(restored.layout, config.layout);
+        assert_ne!(Config::default().device_id, config.device_id);
+    }
 
     #[test]
     fn existing_settings_default_to_screen_relative_motion() {

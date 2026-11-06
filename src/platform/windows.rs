@@ -1,11 +1,13 @@
 use super::InputInjectionError;
 use crate::{
     engine::Runtime,
-    motion::{CaptureMotion, DesktopBounds, MotionStep, PixelPoint, PointerMotion, SWITCH_DELAY},
-    protocol::{Message, MouseMode},
+    layout::{DeviceInfo, Point, Rect, Screen},
+    motion,
+    protocol::{InputEvent, MouseMode},
 };
 use ::windows::Win32::{
     Foundation::{ERROR_SUCCESS, GetLastError, LPARAM, LRESULT, POINT, SetLastError, WPARAM},
+    Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW},
     System::{
         LibraryLoader::GetModuleHandleW,
         Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST},
@@ -14,7 +16,7 @@ use ::windows::Win32::{
 };
 use anyhow::{Result, bail, ensure};
 use std::{
-    cell::RefCell,
+    cell::Cell,
     collections::HashSet,
     mem::size_of,
     sync::{
@@ -23,7 +25,6 @@ use std::{
         mpsc,
     },
     thread,
-    time::Instant,
 };
 
 const MARKER: usize = 0x4D574252;
@@ -33,7 +34,7 @@ static HOOKS_READY: AtomicBool = AtomicBool::new(false);
 // here so the emergency chord also works while keyboard forwarding is active.
 static MODIFIERS: AtomicU8 = AtomicU8::new(0);
 thread_local! {
-    static CAPTURE: RefCell<Option<(u64, CaptureMotion)>> = const { RefCell::new(None) };
+    static LAST_DIRECTION: Cell<Point> = const { Cell::new(Point { x: 1.0, y: 0.0 }) };
 }
 
 pub fn install_hooks(runtime: Arc<Runtime>) -> Result<()> {
@@ -97,90 +98,99 @@ impl Drop for PhysicalDpiScope {
     }
 }
 
-fn desktop() -> DesktopBounds {
-    // Low-level hook points are physical pixels. Read desktop metrics in the
-    // same coordinate space, restoring the UI thread's DPI context afterwards.
+fn desktop() -> Rect {
     let _dpi = PhysicalDpiScope::new();
     unsafe {
-        DesktopBounds::new(
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
-        )
-    }
-}
-
-fn primary() -> DesktopBounds {
-    let _dpi = PhysicalDpiScope::new();
-    unsafe {
-        DesktopBounds::new(
-            0,
-            0,
-            GetSystemMetrics(SM_CXSCREEN),
-            GetSystemMetrics(SM_CYSCREEN),
-        )
-    }
-}
-
-fn cursor_position() -> Result<PixelPoint> {
-    let mut point = POINT::default();
-    unsafe {
-        GetPhysicalCursorPos(&mut point)?;
-    }
-    Ok(PixelPoint {
-        x: point.x,
-        y: point.y,
-    })
-}
-
-pub fn control_remote(rt: &Runtime) -> Result<()> {
-    ensure!(rt.sharing_enabled(), "请先连接并开启共享");
-    let point = cursor_position()?;
-    if rt.begin_control(
-        primary().entry_ratio(rt.right.load(Ordering::SeqCst)),
-        desktop().height_ratio(point.y),
-    ) && let Err(err) = park_cursor()
-    {
-        rt.reclaim();
-        return Err(err);
-    }
-    Ok(())
-}
-
-fn capture_move(rt: &Runtime, dx: i32, dy: i32) -> Result<Message> {
-    CAPTURE.with_borrow_mut(|capture| {
-        let epoch = rt.capture_epoch.load(Ordering::SeqCst);
-        if capture.as_ref().is_none_or(|(old, _)| *old != epoch) {
-            *capture = Some((
-                epoch,
-                CaptureMotion::enter(
-                    primary(),
-                    rt.right.load(Ordering::SeqCst),
-                    rt.capture_y.load(Ordering::SeqCst),
-                    if rt.capture_relative.load(Ordering::SeqCst) {
-                        MouseMode::Relative
-                    } else {
-                        MouseMode::ScreenRelative
-                    },
-                ),
-            ));
+        Rect {
+            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            width: GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+            height: GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
         }
-        capture
-            .as_mut()
-            .expect("initialized capture")
-            .1
-            .advance(dx, dy)
+    }
+}
+fn primary() -> Rect {
+    let _dpi = PhysicalDpiScope::new();
+    unsafe {
+        Rect {
+            x: 0,
+            y: 0,
+            width: GetSystemMetrics(SM_CXSCREEN).max(2),
+            height: GetSystemMetrics(SM_CYSCREEN).max(2),
+        }
+    }
+}
+pub fn device_info(id: &str, name: &str) -> DeviceInfo {
+    unsafe extern "system" fn monitor(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut ::windows::Win32::Foundation::RECT,
+        data: LPARAM,
+    ) -> ::windows::core::BOOL {
+        unsafe {
+            let screens = &mut *(data.0 as *mut Vec<Screen>);
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+            if GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+                let r = info.monitorInfo.rcMonitor;
+                let len = info
+                    .szDevice
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(info.szDevice.len());
+                screens.push(Screen {
+                    name: String::from_utf16_lossy(&info.szDevice[..len]),
+                    rect: Rect {
+                        x: r.left,
+                        y: r.top,
+                        width: r.right - r.left,
+                        height: r.bottom - r.top,
+                    },
+                    primary: info.monitorInfo.dwFlags & 1 != 0,
+                });
+            }
+            true.into()
+        }
+    }
+    let _dpi = PhysicalDpiScope::new();
+    let mut screens = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(monitor),
+            LPARAM((&mut screens as *mut Vec<Screen>) as isize),
+        );
+    }
+    if screens.is_empty() {
+        screens.push(Screen {
+            name: "Primary".into(),
+            rect: primary(),
+            primary: true,
+        });
+    }
+    DeviceInfo {
+        id: id.into(),
+        name: name.into(),
+        bounds: desktop(),
+        screens,
+    }
+}
+pub fn cursor_position() -> Result<Point> {
+    let mut p = POINT::default();
+    unsafe {
+        GetPhysicalCursorPos(&mut p)?;
+    }
+    Ok(Point {
+        x: p.x as f64,
+        y: p.y as f64,
     })
 }
-
 pub fn park_cursor() -> Result<()> {
-    let bounds = desktop();
-    move_absolute(bounds, bounds.center())
+    move_absolute(desktop(), primary().center())
 }
-
-fn move_absolute(bounds: DesktopBounds, point: PixelPoint) -> Result<()> {
-    let (x, y) = bounds.absolute(point);
+fn move_absolute(bounds: Rect, point: Point) -> Result<()> {
+    let (x, y) = motion::absolute(bounds, point);
     mouse_input(
         x,
         y,
@@ -211,22 +221,24 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         let kind = wp.0 as u32;
         if !rt.remote.load(Ordering::Relaxed)
             && kind == WM_MOUSEMOVE
-            && rt.edge.load(Ordering::Relaxed)
-            && rt.can_switch()
+            && let Ok(previous) = cursor_position()
         {
-            let bounds = desktop();
-            let right = rt.right.load(Ordering::Relaxed);
-            if bounds.crosses_edge(
-                PixelPoint {
-                    x: event.pt.x,
-                    y: event.pt.y,
-                },
-                right,
-                rt.block_corners.load(Ordering::Relaxed),
-            ) && rt.begin_control(
-                primary().entry_ratio(right),
-                bounds.height_ratio(event.pt.y),
-            ) {
+            let p = Point {
+                x: event.pt.x as f64,
+                y: event.pt.y as f64,
+            };
+            let mut delta = Point {
+                x: p.x - previous.x,
+                y: p.y - previous.y,
+            };
+            LAST_DIRECTION.with(|last| {
+                if delta.x == 0.0 && delta.y == 0.0 {
+                    delta = last.get();
+                } else {
+                    last.set(delta);
+                }
+            });
+            if rt.edge_at(p, delta) {
                 if park_cursor().is_err() {
                     rt.reclaim();
                     return CallNextHookEx(None, code, wp, lp);
@@ -244,41 +256,39 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
                     rt.reclaim();
                     return CallNextHookEx(None, code, wp, lp);
                 }
-                match capture_move(
-                    rt,
+                return if rt.capture(
                     event.pt.x.saturating_sub(anchor.x),
                     event.pt.y.saturating_sub(anchor.y),
                 ) {
-                    Ok(message) => message,
-                    Err(_) => {
-                        rt.reclaim();
-                        return CallNextHookEx(None, code, wp, lp);
-                    }
-                }
+                    LRESULT(1)
+                } else {
+                    CallNextHookEx(None, code, wp, lp)
+                };
             }
-            WM_LBUTTONDOWN | WM_LBUTTONUP => Message::Button {
+
+            WM_LBUTTONDOWN | WM_LBUTTONUP => InputEvent::Button {
                 button: 1,
                 down: kind == WM_LBUTTONDOWN,
             },
-            WM_RBUTTONDOWN | WM_RBUTTONUP => Message::Button {
+            WM_RBUTTONDOWN | WM_RBUTTONUP => InputEvent::Button {
                 button: 2,
                 down: kind == WM_RBUTTONDOWN,
             },
-            WM_MBUTTONDOWN | WM_MBUTTONUP => Message::Button {
+            WM_MBUTTONDOWN | WM_MBUTTONUP => InputEvent::Button {
                 button: 3,
                 down: kind == WM_MBUTTONDOWN,
             },
-            WM_XBUTTONDOWN | WM_XBUTTONUP => Message::Button {
+            WM_XBUTTONDOWN | WM_XBUTTONUP => InputEvent::Button {
                 button: if event.mouseData >> 16 == 1 { 4 } else { 5 },
                 down: kind == WM_XBUTTONDOWN,
             },
-            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => Message::Wheel {
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => InputEvent::Wheel {
                 delta: (event.mouseData >> 16) as i16 as i32,
                 horizontal: kind == WM_MOUSEHWHEEL,
             },
             _ => return CallNextHookEx(None, code, wp, lp),
         };
-        if rt.send(message) {
+        if rt.send_input(message) {
             LRESULT(1)
         } else {
             CallNextHookEx(None, code, wp, lp)
@@ -329,7 +339,7 @@ unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
         }
         if rt.remote.load(Ordering::Relaxed)
             && rt.keyboard.load(Ordering::Relaxed)
-            && rt.send(Message::Key {
+            && rt.send_input(InputEvent::Key {
                 vk: event.vkCode as u16,
                 scan: event.scanCode as u16,
                 extended: event.flags.contains(LLKHF_EXTENDED),
@@ -424,64 +434,39 @@ fn button_input(button: u8, down: bool) -> Result<()> {
 pub struct Injector {
     keys: HashSet<(u16, u16, bool)>,
     buttons: HashSet<u8>,
-    motion: PointerMotion,
-    entered_at: Option<Instant>,
+    mode: Option<MouseMode>,
 }
-
 impl Injector {
-    pub fn enter(&mut self, from_left: bool, x: u16, y: u16, mode: MouseMode) -> Result<()> {
+    pub fn enter_at(&mut self, point: Point, mode: MouseMode) -> Result<()> {
         self.release_all();
-        let bounds = desktop();
-        let point = self.motion.enter(bounds, from_left, y, mode, x);
-        self.entered_at = Some(Instant::now());
-        move_absolute(bounds, point)
+        self.mode = Some(mode);
+        ensure!(desktop().contains(point), "鼠标位置超出本机桌面");
+        move_absolute(desktop(), point)
     }
-
-    pub fn return_cursor(&mut self, peer_on_right: bool, y: u16) -> Result<()> {
-        let bounds = desktop();
-        move_absolute(bounds, bounds.entry(!peer_on_right, y))
-    }
-
-    fn can_return(&self) -> bool {
-        self.entered_at
-            .is_some_and(|entered| entered.elapsed() >= SWITCH_DELAY)
-    }
-
-    pub fn poll_return(&self, block_corners: bool) -> Result<Option<u16>> {
-        if self.motion.is_relative() && self.can_return() {
-            let bounds = desktop();
-            let point = cursor_position()?;
-            Ok(self
-                .motion
-                .observe(bounds, point)
-                .filter(|_| bounds.outside_corner(point.y, block_corners)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Returns the crossing height when control should return to the source PC.
-    pub fn apply(
-        &mut self,
-        message: Message,
-        keyboard: bool,
-        block_corners: bool,
-    ) -> Result<Option<u16>> {
-        match message {
-            Message::Move { dx, dy } => {
-                self.motion.relative(dx, dy)?;
+    pub fn apply_event(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
+        match event {
+            InputEvent::Relative { dx, dy } => {
+                ensure!(self.mode == Some(MouseMode::Relative), "鼠标模式不匹配");
+                ensure!(
+                    dx.unsigned_abs() <= 32768 && dy.unsigned_abs() <= 32768,
+                    "鼠标位移无效"
+                );
                 mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE)?;
             }
-            Message::MoveAbsolute { x, y } => {
+            InputEvent::Absolute { x, y } => {
+                ensure!(
+                    self.mode == Some(MouseMode::ScreenRelative),
+                    "鼠标模式不匹配"
+                );
+                let p = Point {
+                    x: x as f64,
+                    y: y as f64,
+                };
                 let bounds = desktop();
-                let can_return = self.can_return()
-                    && bounds.outside_corner(bounds.point_at(x, y).y, block_corners);
-                match self.motion.absolute(bounds, x, y, can_return)? {
-                    MotionStep::ReturnLocal { y } => return Ok(Some(y)),
-                    MotionStep::MoveTo(point) => move_absolute(bounds, point)?,
-                }
+                ensure!(bounds.contains(p), "鼠标坐标无效");
+                move_absolute(bounds, p)?;
             }
-            Message::Button { button, down } => {
+            InputEvent::Button { button, down } => {
                 button_input(button, down)?;
                 if down {
                     self.buttons.insert(button);
@@ -489,7 +474,7 @@ impl Injector {
                     self.buttons.remove(&button);
                 }
             }
-            Message::Wheel { delta, horizontal } => {
+            InputEvent::Wheel { delta, horizontal } => {
                 ensure!(delta.unsigned_abs() <= 32768, "滚轮位移无效");
                 mouse_input(
                     0,
@@ -502,7 +487,7 @@ impl Injector {
                     },
                 )?;
             }
-            Message::Key {
+            InputEvent::Key {
                 vk,
                 scan,
                 extended,
@@ -518,13 +503,11 @@ impl Injector {
             }
             _ => {}
         }
-        Ok(None)
+        Ok(())
     }
 
     pub fn release_all(&mut self) {
-        // Control ownership is gated by Runtime. A fresh Enter replaces the
-        // motion origin; releasing held keys must not erase a newer entry's
-        // position if a pending local-return notification is processed later.
+        self.mode = None;
         for (vk, scan, extended) in self.keys.drain() {
             let _ = key_input(vk, scan, extended, false);
         }
@@ -543,6 +526,14 @@ impl Drop for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_inventory_is_valid_in_physical_pixel_space() {
+        let info = device_info("00000000000000000000000000000001", "display-test");
+        info.validate().unwrap();
+        assert!(info.screens.iter().any(|s| s.primary));
+        assert_eq!(info.bounds, desktop());
+    }
 
     #[test]
     #[ignore = "requires an interactive Windows desktop; sends only a zero-distance move"]

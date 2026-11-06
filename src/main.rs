@@ -12,11 +12,11 @@ use mwb::{
         validate_pairing_key,
     },
     engine::{self, Runtime},
+    layout::{Layout, Point as LayoutPoint},
     platform,
-    protocol::{MAX_TEXT_BYTES, Message},
 };
 use std::{
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
@@ -25,6 +25,14 @@ const MUTED: u32 = 0x7B8781;
 const GREEN: u32 = 0x227455;
 const BORDER: u32 = 0xE4E9E5;
 
+struct CanvasDrag {
+    id: String,
+    start: Point<Pixels>,
+    x: i32,
+    y: i32,
+    scale: f64,
+}
+
 struct Workspace {
     config: Config,
     runtime: Arc<Runtime>,
@@ -32,6 +40,16 @@ struct Workspace {
     key_length: Entity<InputState>,
     address: Entity<InputState>,
     tab: usize,
+    layout_draft: Layout,
+    layout_revision: u64,
+    layout_dirty: bool,
+    selected: String,
+    drag: Option<CanvasDrag>,
+    pan_drag: Option<(Point<Pixels>, LayoutPoint)>,
+    canvas_bounds: Arc<Mutex<Bounds<Pixels>>>,
+    view_scale: f64,
+    view_offset: LayoutPoint,
+    fit_pending: bool,
     notice: String,
     show_key: bool,
     preparing: bool,
@@ -40,11 +58,16 @@ struct Workspace {
 
 impl Workspace {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (config, notice) = match Config::load() {
+        let (config, mut notice) = match Config::load() {
             Ok(config) => (config, String::new()),
             Err(err) => (Config::default(), format!("{err:#}")),
         };
+        if let Err(err) = config.save() {
+            notice = format!("保存设备标识失败：{err:#}");
+        }
         let runtime = Runtime::new(&config);
+        let layout_draft = runtime.snapshot().layout;
+        let selected = config.device_id.clone();
         let key = new_pairing_key().expect("Windows secure random source unavailable");
         let secret = cx.new(|cx| InputState::new(window, cx).default_value(key).masked(true));
         let key_length = cx.new(|cx| InputState::new(window, cx).default_value("64"));
@@ -58,7 +81,13 @@ impl Workspace {
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                if this
+                    .update(cx, |this, cx| {
+                        this.refresh_layout();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -70,6 +99,16 @@ impl Workspace {
             key_length,
             address,
             tab: 0,
+            layout_draft,
+            layout_revision: 0,
+            layout_dirty: false,
+            selected,
+            drag: None,
+            pan_drag: None,
+            canvas_bounds: Arc::new(Mutex::new(Bounds::default())),
+            view_scale: 0.12,
+            view_offset: LayoutPoint { x: 32.0, y: 60.0 },
+            fit_pending: true,
             notice,
             show_key: false,
             preparing: false,
@@ -167,22 +206,104 @@ impl Workspace {
     }
 
     fn copy_clipboard(&mut self, cx: &mut Context<Self>) {
-        let result = (|| -> anyhow::Result<()> {
-            let text = arboard::Clipboard::new()?.get_text()?;
-            anyhow::ensure!(text.len() <= MAX_TEXT_BYTES, "首版支持最多 32 KB 文本");
-            let message = Message::Clipboard(text);
-            anyhow::ensure!(
-                serde_json::to_vec(&message)?.len() + 16 <= mwb::transport::MAX_FRAME,
-                "文本转义后超过单帧限制，请减少文本长度"
-            );
-            anyhow::ensure!(self.runtime.send(message), "发送队列不可用");
-            Ok(())
-        })();
+        let result = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_text())
+            .map_err(anyhow::Error::from)
+            .and_then(|text| self.runtime.clipboard(self.selected.clone(), text));
         self.notice = match result {
-            Ok(()) => "已发送本机剪贴板文本".into(),
-            Err(err) => format!("{err:#}"),
+            Ok(()) => "剪贴板文本已加入发送队列".into(),
+            Err(e) => format!("{e:#}"),
         };
         cx.notify();
+    }
+
+    fn refresh_layout(&mut self) {
+        let state = self.runtime.snapshot();
+        if self.config.layout != state.layout {
+            self.config.layout = state.layout.clone();
+            self.persist();
+        }
+        if !self.layout_dirty
+            && self.drag.is_none()
+            && (self.layout_draft != state.layout || self.layout_revision != state.revision)
+        {
+            if self.layout_draft.devices.len() != state.layout.devices.len() {
+                self.fit_pending = true;
+            }
+            self.layout_draft = state.layout;
+            self.layout_revision = state.revision;
+        }
+        if self.fit_pending {
+            self.fit_canvas();
+        }
+    }
+    fn fit_canvas(&mut self) {
+        let bounds = *self.canvas_bounds.lock().unwrap();
+        let width = f32::from(bounds.size.width) as f64;
+        let height = f32::from(bounds.size.height) as f64;
+        if width < 100.0 || height < 100.0 {
+            return;
+        }
+        let extent = self.layout_draft.extent();
+        self.view_scale = ((width - 80.0) / extent.width as f64)
+            .min((height - 100.0) / extent.height as f64)
+            .clamp(0.002, 1.0);
+        self.view_offset = LayoutPoint {
+            x: (width - extent.width as f64 * self.view_scale) / 2.0
+                - extent.x as f64 * self.view_scale,
+            y: (height - extent.height as f64 * self.view_scale) / 2.0
+                - extent.y as f64 * self.view_scale,
+        };
+        self.fit_pending = false;
+    }
+    fn zoom_canvas(&mut self, factor: f64) {
+        let b = *self.canvas_bounds.lock().unwrap();
+        let center = LayoutPoint {
+            x: f32::from(b.size.width) as f64 / 2.0,
+            y: f32::from(b.size.height) as f64 / 2.0,
+        };
+        let next = (self.view_scale * factor).clamp(0.002, 2.0);
+        let ratio = next / self.view_scale;
+        self.view_offset = LayoutPoint {
+            x: center.x + (self.view_offset.x - center.x) * ratio,
+            y: center.y + (self.view_offset.y - center.y) * ratio,
+        };
+        self.view_scale = next;
+    }
+    fn canvas_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if let Some(drag) = &self.drag {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.drag = None;
+                return;
+            }
+            if let Some(d) = self
+                .layout_draft
+                .devices
+                .iter_mut()
+                .find(|d| d.info.id == drag.id)
+            {
+                d.x = (drag.x as f64
+                    + f32::from(event.position.x - drag.start.x) as f64 / drag.scale)
+                    .round()
+                    .clamp(-1_000_000.0, 1_000_000.0) as i32;
+                d.y = (drag.y as f64
+                    + f32::from(event.position.y - drag.start.y) as f64 / drag.scale)
+                    .round()
+                    .clamp(-1_000_000.0, 1_000_000.0) as i32;
+                self.layout_dirty = true;
+                cx.notify();
+            }
+        } else if let Some((start, offset)) = self.pan_drag {
+            if event.pressed_button != Some(MouseButton::Middle) {
+                self.pan_drag = None;
+                return;
+            }
+            self.view_offset = LayoutPoint {
+                x: offset.x + f32::from(event.position.x - start.x) as f64,
+                y: offset.y + f32::from(event.position.y - start.y) as f64,
+            };
+            cx.notify();
+        }
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -301,34 +422,173 @@ impl Workspace {
     }
 
     fn devices(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.runtime.snapshot();
-        let local = device_card(
-            "01 / 本机",
-            self.config.name.clone(),
-            "当前 Windows 电脑".into(),
-            true,
-            true,
-        );
-        let peer = device_card(
-            "02 / 另一台电脑",
-            if state.connected {
-                state.peer_name.clone()
-            } else {
-                "等待配对".into()
-            },
-            if state.connected {
-                state.address.clone()
-            } else {
-                "连接后显示设备信息".into()
-            },
-            false,
-            state.connected,
-        );
-        let (first, second) = if self.config.peer_on_right {
-            (local, peer)
-        } else {
-            (peer, local)
-        };
+        let saved = self.runtime.snapshot();
+        let invalid = self.layout_draft.validate().err().map(|e| e.to_string());
+        let bounds = self.canvas_bounds.clone();
+        let mut area = div()
+            .id("layout-canvas")
+            .relative()
+            .w_full()
+            .h(px(400.))
+            .overflow_hidden()
+            .rounded_lg()
+            .bg(rgb(0xF2F5F1))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .child(
+                canvas(
+                    move |b, _, _| {
+                        *bounds.lock().unwrap() = b;
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .on_mouse_move(
+                cx.listener(|this, event: &MouseMoveEvent, _, cx| this.canvas_move(event, cx)),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.drag = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.drag = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, _, _| {
+                    this.pan_drag = Some((event.position, this.view_offset));
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, _, _, _| this.pan_drag = None),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, _, _, _| this.pan_drag = None),
+            );
+        for row in 1..10 {
+            area = area.child(
+                div()
+                    .absolute()
+                    .top(px(row as f32 * 40.))
+                    .left_0()
+                    .w_full()
+                    .h(px(1.))
+                    .bg(rgb(0xE6ECE4)),
+            );
+        }
+        for column in 1..28 {
+            area = area.child(
+                div()
+                    .absolute()
+                    .left(px(column as f32 * 40.))
+                    .top_0()
+                    .h_full()
+                    .w(px(1.))
+                    .bg(rgb(0xE6ECE4)),
+            );
+        }
+        for device in &self.layout_draft.devices {
+            let x = self.view_offset.x + device.x as f64 * self.view_scale;
+            let y = self.view_offset.y + device.y as f64 * self.view_scale;
+            let selected = self.selected == device.info.id;
+            let online = saved.layout.get(&device.info.id).is_some_and(|d| d.online);
+            let local = device.info.id == self.runtime.local.id;
+            for (index, screen) in device.info.screens.iter().enumerate() {
+                let screen_x = x + (screen.rect.x - device.info.bounds.x) as f64 * self.view_scale;
+                let screen_y = y + (screen.rect.y - device.info.bounds.y) as f64 * self.view_scale;
+                let w = screen.rect.width as f64 * self.view_scale;
+                let h = screen.rect.height as f64 * self.view_scale;
+                let id = device.info.id.clone();
+                let origin = (device.x, device.y);
+                let screen_element = div()
+                    .id(format!("screen-{}-{index}", id))
+                    .absolute()
+                    .left(px(screen_x as f32))
+                    .top(px(screen_y as f32))
+                    .w(px(w as f32))
+                    .h(px(h as f32))
+                    .border_2()
+                    .border_color(rgb(if invalid.is_some() {
+                        0xBF5F4C
+                    } else if selected {
+                        GREEN
+                    } else {
+                        0x9BAE9D
+                    }))
+                    .rounded_md()
+                    .bg(rgb(if !online {
+                        0xE3E7E1
+                    } else if local {
+                        0xE1EED7
+                    } else {
+                        0xE8F0E9
+                    }))
+                    .overflow_hidden()
+                    .v_flex()
+                    .justify_center()
+                    .items_center()
+                    .gap_1()
+                    .p_2()
+                    .when(w > 75.0 && h > 35.0, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(device.info.name.clone()),
+                        )
+                    })
+                    .when(w > 95.0 && h > 65.0, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .child(format!("{} × {}", screen.rect.width, screen.rect.height)),
+                        )
+                    })
+                    .when(w > 95.0 && h > 90.0, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(GREEN))
+                                .child(if local {
+                                    "本机"
+                                } else if online {
+                                    "在线"
+                                } else {
+                                    "离线"
+                                }),
+                        )
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.runtime.return_local();
+                            this.selected = id.clone();
+                            this.drag = Some(CanvasDrag {
+                                id: id.clone(),
+                                start: event.position,
+                                x: origin.0,
+                                y: origin.1,
+                                scale: this.view_scale,
+                            });
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    );
+                area = area.child(screen_element);
+            }
+        }
         card()
             .gap_3()
             .child(
@@ -343,66 +603,115 @@ impl Workspace {
                             .child(
                                 div()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("你的桌面，连在一起"),
+                                    .child("你的设备，自由摆放"),
                             )
-                            .child(subtle("将另一台电脑放在屏幕左侧或右侧。")),
+                            .child(subtle(
+                                "按实际分辨率等比例显示 · 拖动屏幕调整位置 · 中键拖动画布",
+                            )),
                     )
-                    .child(
-                        Button::new("flip")
-                            .ghost()
-                            .icon(assets::IconName::ArrowLeftRight)
-                            .label("交换位置")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.runtime.return_local();
-                                this.config.peer_on_right = !this.config.peer_on_right;
-                                this.runtime
-                                    .right
-                                    .store(this.config.peer_on_right, Ordering::SeqCst);
-                                this.persist();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap_5()
-                    .py_1()
-                    .child(first)
                     .child(
                         div()
-                            .v_flex()
-                            .items_center()
+                            .h_flex()
                             .gap_2()
-                            .text_color(rgb(if state.connected { GREEN } else { 0xBEC8C0 }))
-                            .child(Icon::new(assets::IconName::ArrowLeftRight).size_5())
-                            .child(div().text_size(px(10.)).child(if state.connected {
-                                "已加密"
-                            } else {
-                                "待连接"
-                            })),
-                    )
-                    .child(second),
+                            .child(Button::new("zoom-out").small().label("−").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.zoom_canvas(0.8);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                Button::new("zoom-in")
+                                    .small()
+                                    .label("+")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.zoom_canvas(1.25);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("fit-layout")
+                                    .small()
+                                    .label("适应画布")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.fit_canvas();
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
+            .child(area)
+            .child(div().h_flex().flex_wrap().gap_2().children(
+                self.layout_draft.devices.iter().map(|d| {
+                    let id = d.info.id.clone();
+                    let label = format!(
+                        "{} · {} × {}",
+                        d.info.name, d.info.bounds.width, d.info.bounds.height
+                    );
+                    Button::new(format!("select-{}", id))
+                        .small()
+                        .label(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected = id.clone();
+                            cx.notify();
+                        }))
+                }),
+            ))
             .child(
                 div()
                     .h_flex()
                     .items_center()
                     .justify_between()
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .pt_3()
-                    .child(subtle(if self.config.peer_on_right {
-                        "向右越过屏幕边缘 → 控制另一台电脑"
-                    } else {
-                        "向左越过屏幕边缘 ← 控制另一台电脑"
-                    }))
+                    .gap_3()
+                    .child(subtle(invalid.unwrap_or_else(|| {
+                        if self.layout_dirty {
+                            "布局尚未保存；支持任意偏移和间隙，无需对齐网格。".into()
+                        } else {
+                            format!(
+                                "{} 台设备 · 保存后同步整个工作组 · {:.0}%",
+                                self.layout_draft.devices.len(),
+                                self.view_scale * 100.0
+                            )
+                        }
+                    })))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("左右布局 · 2 台设备"),
+                            .h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("reset-layout")
+                                    .small()
+                                    .ghost()
+                                    .label("还原")
+                                    .disabled(!self.layout_dirty)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.layout_dirty = false;
+                                        this.drag = None;
+                                        this.refresh_layout();
+                                        this.fit_canvas();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("save-layout")
+                                    .small()
+                                    .primary()
+                                    .label("保存布局")
+                                    .disabled(!self.layout_dirty)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        match this.runtime.arrange(
+                                            this.layout_revision,
+                                            this.layout_draft.placements(),
+                                        ) {
+                                            Ok(()) => {
+                                                this.layout_dirty = false;
+                                                this.notice =
+                                                    "布局已提交，应用后会同步到工作组。".into();
+                                            }
+                                            Err(e) => this.notice = format!("{e:#}"),
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
     }
@@ -419,7 +728,7 @@ impl Workspace {
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("连接一台电脑"),
+                            .child("连接工作组"),
                     )
                     .child(
                         div()
@@ -510,7 +819,7 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .gap_3()
-                            .child(div().text_sm().child("2. 输入对方 IP 地址或主机名"))
+                            .child(div().text_sm().child("2. 加入时填写连接中心的 IP 或主机名"))
                             .child(Input::new(&self.address).disabled(running))
                             .child(
                                 div()
@@ -518,7 +827,7 @@ impl Workspace {
                                     .gap_2()
                                     .child(
                                         Button::new("listen")
-                                            .label("等待连接")
+                                            .label("创建工作组")
                                             .disabled(running)
                                             .on_click(
                                                 cx.listener(|this, _, _, cx| this.start(false, cx)),
@@ -531,7 +840,7 @@ impl Workspace {
                                             .label(if self.preparing {
                                                 "准备配对…"
                                             } else {
-                                                "连接电脑"
+                                                "加入工作组"
                                             })
                                             .disabled(running)
                                             .on_click(
@@ -539,7 +848,7 @@ impl Workspace {
                                             ),
                                     ),
                             )
-                            .child(subtle("一端等待，另一端填写地址并连接。")),
+                            .child(subtle("一台电脑创建工作组，其他电脑使用相同密钥加入。连接中心需保持运行。")),
                     ),
             )
     }
@@ -549,6 +858,12 @@ impl Workspace {
         let enabled = self.runtime.sharing_enabled();
         let remote = self.runtime.remote.load(Ordering::SeqCst);
         let incoming = self.runtime.incoming.load(Ordering::SeqCst);
+        let selected_online = self
+            .runtime
+            .snapshot()
+            .layout
+            .get(&self.selected)
+            .is_some_and(|d| d.online && d.info.id != self.runtime.local.id);
         card()
             .gap_4()
             .child(
@@ -620,8 +935,8 @@ impl Workspace {
                                 Button::new("send-clipboard")
                                     .small()
                                     .ghost()
-                                    .label("发送剪贴板文本")
-                                    .disabled(!connected || !enabled)
+                                    .label("发送文本到选中设备")
+                                    .disabled(!connected || !enabled || !selected_online)
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.copy_clipboard(cx)),
                                     ),
@@ -629,15 +944,16 @@ impl Workspace {
                             .child(
                                 Button::new("control")
                                     .small()
-                                    .label("控制对方")
+                                    .label("控制选中设备")
                                     .disabled(
                                         !connected
                                             || !enabled
+                                            || !selected_online
                                             || remote
                                             || self.runtime.incoming.load(Ordering::SeqCst),
                                     )
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Err(err) = platform::control_remote(&this.runtime) {
+                                        if let Err(err) = this.runtime.control(&this.selected) {
                                             this.notice = format!("无法切换控制：{err:#}");
                                         }
                                         cx.notify();
@@ -674,7 +990,7 @@ impl Workspace {
             ))
             .child(option_row(
                 "从屏幕边缘切换",
-                "鼠标跨过设备相邻的屏幕边缘时，将控制权交给对方。",
+                "按画布中的屏幕位置和移动方向切换；允许错位与空隙。",
                 Button::new("edge-toggle")
                     .label(if self.config.edge_switch {
                         "已开启"
@@ -692,7 +1008,7 @@ impl Workspace {
             ))
             .child(option_row(
                 "避开屏幕角落",
-                "开启后，左右边缘顶部和底部各 100 像素不触发切换或返回。手动控制不受影响。",
+                "开启后，每块屏幕四角的 100 像素区域不触发切换。手动控制不受影响。",
                 Button::new("block-corners-toggle")
                     .label(if self.config.block_corners {
                         "已开启"
@@ -755,16 +1071,18 @@ impl Workspace {
                 "立即停止本机共享，并释放远端按下的按键。",
                 div().text_sm().child("Ctrl + Alt + Home"),
             ))
-            .child(subtle("设备左右位置、共享偏好和对方地址会自动保存在本机。"))
+            .child(subtle(
+                "设备标识、已保存布局、共享偏好和连接中心地址会保存在本机。",
+            ))
     }
 
     fn about(&self) -> impl IntoElement {
         card().gap_5()
-            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("一套键鼠，两台电脑。"))
+            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("一套键鼠，自由连接。"))
             .child(subtle(format!("MWB Rust · {} 预览版", env!("CARGO_PKG_VERSION"))))
             .child(div().text_sm().child("以 Rust + GPUI Kit 重写 Mouse without Borders 的核心使用流程。"))
-            .child(div().text_sm().child("当前支持：两台 Windows 电脑直连、自动重连、屏幕比例 / 相对鼠标移动、密钥配对、加密键鼠传输、左右越界切换、角落避让、手动发送文本剪贴板。"))
-            .child(div().text_sm().child("后续计划：自动发现、多设备布局、文件传输、托盘与后台服务。"))
+            .child(div().text_sm().child("当前支持：最多 16 台设备的工作组、按真实分辨率自由拖拽布局、任意设备之间的键鼠切换、自动重连和手动文本剪贴板。"))
+            .child(div().text_sm().child("后续计划：自动发现、文件传输、托盘与后台服务。"))
             .child(div().text_sm().child("两端均需运行本重写版。普通用户权限下运行，当前不支持 UAC 安全桌面。"))
             .child(div().text_xs().text_color(rgb(MUTED)).child("Native UI · GPUI Kit 0.8.1  /  Transport · Noise + ChaCha20-Poly1305"))
     }
@@ -894,7 +1212,7 @@ impl Render for Workspace {
                                             .child(subtle(
                                                 [
                                                     "在相邻的电脑间，自然地移动、输入与协作。",
-                                                    "为你的双机桌面，设置顺手的工作方式。",
+                                                    "为你的多设备桌面，设置顺手的工作方式。",
                                                     "一个原生、轻量的桌面共享工具。",
                                                 ][self.tab],
                                             )),
@@ -974,77 +1292,6 @@ fn option_row(title: &'static str, desc: &'static str, control: impl IntoElement
         .border_color(rgb(BORDER))
         .child(div().v_flex().gap_2().child(title).child(subtle(desc)))
         .child(control)
-}
-
-fn device_card(
-    label: &'static str,
-    name: String,
-    info: String,
-    local: bool,
-    connected: bool,
-) -> Div {
-    div()
-        .v_flex()
-        .flex_1()
-        .min_w_0()
-        .items_center()
-        .gap_1()
-        .child(
-            div()
-                .h_flex()
-                .w_full()
-                .justify_between()
-                .mb_1()
-                .text_size(px(10.))
-                .text_color(rgb(MUTED))
-                .child(label)
-                .child(if local { "THIS DEVICE" } else { "PEER DEVICE" }),
-        )
-        .child(
-            div()
-                .v_flex()
-                .items_center()
-                .w(px(168.))
-                .h(px(70.))
-                .rounded_lg()
-                .border_2()
-                .border_color(rgb(if local || connected {
-                    0x94AC96
-                } else {
-                    0xD5DDD6
-                }))
-                .bg(rgb(if local { 0xEFF4E8 } else { 0xF6F8F5 }))
-                .justify_center()
-                .gap_1()
-                .child(
-                    Icon::new(assets::IconName::Monitor)
-                        .size_6()
-                        .text_color(rgb(if local || connected { GREEN } else { 0xB8C4BA })),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        .text_color(rgb(MUTED))
-                        .child(if local {
-                            "你的工作，从这里出发"
-                        } else if connected {
-                            "已建立加密连接"
-                        } else {
-                            "等待另一台电脑加入"
-                        }),
-                ),
-        )
-        .child(div().w(px(2.)).h(px(8.)).bg(rgb(0xBECBBF)))
-        .child(
-            div()
-                .w(px(44.))
-                .h(px(3.))
-                .rounded_full()
-                .bg(rgb(0xBECBBF))
-                .mb_0(),
-        )
-        .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
-        .child(div().text_size(px(10.)).text_color(rgb(MUTED)).child(info))
 }
 
 fn main() {

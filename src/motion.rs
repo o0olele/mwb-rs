@@ -1,420 +1,112 @@
-use crate::protocol::{Message, MouseMode};
-use anyhow::{Result, ensure};
-
-const SCALE: i64 = 65535;
+use crate::{
+    layout::{DeviceInfo, Point, Rect},
+    protocol::MouseMode,
+};
 pub(crate) const SWITCH_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PixelPoint {
-    pub x: i32,
-    pub y: i32,
+/// Win32 absolute coordinates refer to pixel centres, not rectangle boundaries.
+pub(crate) fn absolute(bounds: Rect, p: Point) -> (i32, i32) {
+    fn axis(v: f64, start: i32, size: i32) -> i32 {
+        let offset = (v.round() as i64 - i64::from(start)).clamp(0, i64::from(size) - 1);
+        (((offset * 2 + 1) * 32768 / i64::from(size)).min(65535)) as i32
+    }
+    (
+        axis(p.x, bounds.x, bounds.width),
+        axis(p.y, bounds.y, bounds.height),
+    )
 }
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct DesktopBounds {
-    pub left: i32,
-    pub top: i32,
-    pub width: i32,
-    pub height: i32,
+pub(crate) struct RemoteMotion {
+    pub point: Point,
+    pub direction: Point,
+    source: Rect,
+    target: DeviceInfo,
+    pub mode: MouseMode,
 }
-
-impl DesktopBounds {
-    pub fn new(left: i32, top: i32, width: i32, height: i32) -> Self {
+impl RemoteMotion {
+    pub fn new(source: Rect, target: DeviceInfo, point: Point, mode: MouseMode) -> Self {
         Self {
-            left,
-            top,
-            width: width.max(1),
-            height: height.max(1),
-        }
-    }
-    pub fn right(self) -> i32 {
-        self.left.saturating_add(self.width - 1)
-    }
-    pub fn outside_corner(self, y: i32, block_corners: bool) -> bool {
-        // The current layout has only left/right neighbours. Reserve 100
-        // physical pixels at both ends of those edges when the option is on.
-        !block_corners
-            || (i64::from(y) - i64::from(self.top) >= 100
-                && i64::from(self.top) + i64::from(self.height) - 1 - i64::from(y) >= 100)
-    }
-    pub fn crosses_edge(self, point: PixelPoint, right: bool, block_corners: bool) -> bool {
-        (if right {
-            point.x >= self.right()
-        } else {
-            point.x <= self.left
-        }) && self.outside_corner(point.y, block_corners)
-    }
-    pub fn center(self) -> PixelPoint {
-        PixelPoint {
-            x: self.left.saturating_add(self.width / 2),
-            y: self.top.saturating_add(self.height / 2),
-        }
-    }
-    pub fn height_ratio(self, y: i32) -> u16 {
-        screen_axis(y, self.top, self.height).clamp(0, 65535) as u16
-    }
-    pub fn point_at(self, x: i32, y: i32) -> PixelPoint {
-        PixelPoint {
-            x: decode_axis(x, self.left, self.width),
-            y: decode_axis(y, self.top, self.height),
-        }
-    }
-    pub fn entry(self, from_left: bool, y: u16) -> PixelPoint {
-        let inset = 4.min(self.width - 1);
-        PixelPoint {
-            x: if from_left {
-                self.left.saturating_add(inset)
-            } else {
-                self.right().saturating_sub(inset)
-            },
-            y: decode_axis(i32::from(y), self.top, self.height),
-        }
-    }
-    pub fn entry_ratio(self, from_left: bool) -> u16 {
-        screen_axis(self.entry(from_left, 32768).x, self.left, self.width).clamp(0, 65535) as u16
-    }
-    pub fn absolute(self, point: PixelPoint) -> (i32, i32) {
-        (
-            normalize_axis(point.x, self.left, self.width),
-            normalize_axis(point.y, self.top, self.height),
-        )
-    }
-}
-fn screen_axis(coordinate: i32, origin: i32, extent: i32) -> i32 {
-    ((i64::from(coordinate) - i64::from(origin)) * SCALE / i64::from(extent))
-        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-}
-fn decode_axis(ratio: i32, origin: i32, extent: i32) -> i32 {
-    let offset = (i64::from(ratio.clamp(0, 65535)) * i64::from(extent) + SCALE / 2) / SCALE;
-    origin.saturating_add(offset.min(i64::from(extent - 1)) as i32)
-}
-fn normalize_axis(coordinate: i32, origin: i32, extent: i32) -> i32 {
-    let offset = (i64::from(coordinate) - i64::from(origin)).clamp(0, i64::from(extent) - 1);
-    (((offset * 2 + 1) * 32768 / i64::from(extent)).min(65535)) as i32
-}
-fn validate_delta(dx: i32, dy: i32) -> Result<()> {
-    ensure!(
-        dx.unsigned_abs() <= 32768 && dy.unsigned_abs() <= 32768,
-        "鼠标位移无效"
-    );
-    Ok(())
-}
-
-// The controlling PC owns the virtual cursor, in primary-screen pixel units.
-// The receiving PC does not accumulate pixel deltas in screen-relative mode.
-pub(crate) struct CaptureMotion {
-    frame: DesktopBounds,
-    x: i64,
-    y: i64,
-    mode: MouseMode,
-}
-impl CaptureMotion {
-    pub fn enter(primary: DesktopBounds, from_left: bool, y: u16, mode: MouseMode) -> Self {
-        Self {
-            frame: primary,
-            x: (i64::from(primary.entry(from_left, y).x) - i64::from(primary.left)) * SCALE,
-            y: i64::from(primary.height) * i64::from(y),
+            point,
+            direction: Point::default(),
+            source,
+            target,
             mode,
         }
     }
-    pub fn advance(&mut self, dx: i32, dy: i32) -> Result<Message> {
-        validate_delta(dx, dy)?;
-        if self.mode == MouseMode::Relative {
-            return Ok(Message::Move { dx, dy });
+    pub fn advance(&mut self, dx: i32, dy: i32) -> Point {
+        self.direction = Point {
+            x: dx as f64,
+            y: dy as f64,
+        };
+        if self.mode == MouseMode::ScreenRelative {
+            self.point = self.target.clamp(Point {
+                x: self.point.x
+                    + dx as f64 * self.target.bounds.width as f64 / self.source.width as f64,
+                y: self.point.y
+                    + dy as f64 * self.target.bounds.height as f64 / self.source.height as f64,
+            });
         }
-        // Fixed-point source pixels preserve the entry fraction and each small
-        // delta. Both PCs start at the same proportion, preventing a first-move jump.
-        self.x = (self.x + i64::from(dx) * SCALE)
-            .clamp(-SCALE, (i64::from(self.frame.width) + 1) * SCALE);
-        self.y = (self.y + i64::from(dy) * SCALE).clamp(0, i64::from(self.frame.height) * SCALE);
-        let x = (self.x / i64::from(self.frame.width)) as i32;
-        let y = (self.y / i64::from(self.frame.height)) as i32;
-        Ok(Message::MoveAbsolute { x, y })
+        self.point
     }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MotionStep {
-    MoveTo(PixelPoint),
-    ReturnLocal { y: u16 },
-}
-#[derive(Default)]
-pub(crate) struct PointerMotion {
-    mode: Option<MouseMode>,
-    from_left: bool,
-}
-impl PointerMotion {
-    pub fn is_relative(&self) -> bool {
-        self.mode == Some(MouseMode::Relative)
-    }
-    pub fn enter(
-        &mut self,
-        bounds: DesktopBounds,
-        from_left: bool,
-        y: u16,
-        mode: MouseMode,
-        x: u16,
-    ) -> PixelPoint {
-        self.mode = Some(mode);
-        self.from_left = from_left;
-        bounds.point_at(i32::from(x), i32::from(y))
-    }
-    pub fn absolute(
-        &self,
-        bounds: DesktopBounds,
-        x: i32,
-        y: i32,
-        can_return: bool,
-    ) -> Result<MotionStep> {
-        ensure!(
-            self.mode == Some(MouseMode::ScreenRelative),
-            "鼠标移动模式与当前控制会话不符"
-        );
-        ensure!(
-            (-65535..=131070).contains(&x) && (0..=65535).contains(&y),
-            "鼠标比例坐标无效"
-        );
-        if can_return && ((self.from_left && x < 0) || (!self.from_left && x >= 65535)) {
-            return Ok(MotionStep::ReturnLocal { y: y as u16 });
-        }
-        Ok(MotionStep::MoveTo(bounds.point_at(x, y)))
-    }
-    pub fn relative(&self, dx: i32, dy: i32) -> Result<()> {
-        ensure!(
-            self.mode == Some(MouseMode::Relative),
-            "鼠标移动模式与当前控制会话不符"
-        );
-        validate_delta(dx, dy)
-    }
-    // Read queued relative injection's actual result for edge detection only.
-    pub fn observe(&self, bounds: DesktopBounds, point: PixelPoint) -> Option<u16> {
-        if self.mode == Some(MouseMode::Relative)
-            && ((self.from_left && point.x <= bounds.left)
-                || (!self.from_left && point.x >= bounds.right()))
-        {
-            Some(bounds.height_ratio(point.y))
-        } else {
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::layout::test_device;
     #[test]
-    fn corner_guard_reserves_100_physical_pixels_at_both_edge_ends() {
-        for bounds in [
-            DesktopBounds::new(0, 0, 1920, 1080),
-            DesktopBounds::new(-3840, -2160, 3840, 2160),
-        ] {
-            for right in [false, true] {
-                let x = if right { bounds.right() } else { bounds.left };
-                for offset in [0, 99, bounds.height - 100, bounds.height - 1] {
-                    let point = PixelPoint {
-                        x,
-                        y: bounds.top + offset,
-                    };
-                    assert!(!bounds.crosses_edge(point, right, true));
-                    assert!(bounds.crosses_edge(point, right, false));
-                }
-                for offset in [100, bounds.height / 2, bounds.height - 101] {
-                    let point = PixelPoint {
-                        x,
-                        y: bounds.top + offset,
-                    };
-                    assert!(bounds.crosses_edge(point, right, true));
-                    let inside = PixelPoint {
-                        x: x + if right { -1 } else { 1 },
-                        ..point
-                    };
-                    assert!(!bounds.crosses_edge(inside, right, true));
-                    assert!(!bounds.crosses_edge(inside, right, false));
-                }
-            }
-        }
-        // Tiny desktops have no unprotected edge; manual control still works.
-        assert!(!DesktopBounds::new(0, 0, 10, 10).outside_corner(5, true));
-    }
-    fn apply(target: &PointerMotion, bounds: DesktopBounds, msg: Message) -> MotionStep {
-        let Message::MoveAbsolute { x, y } = msg else {
-            panic!("expected screen coordinates")
-        };
-        target.absolute(bounds, x, y, true).unwrap()
-    }
-    #[test]
-    fn normalization_targets_every_physical_pixel_at_common_resolutions() {
-        for extent in [
-            1, 2, 3, 768, 1080, 1366, 1920, 2560, 3840, 7680, 11520, 32768, 65536,
-        ] {
-            for pixel in 0..extent {
-                assert_eq!(
-                    i64::from(normalize_axis(pixel, 0, extent)) * i64::from(extent) / 65536,
-                    i64::from(pixel)
+    fn normalization_targets_every_pixel_with_negative_origins() {
+        for width in [1366, 1920, 2560, 3840, 7680] {
+            let b = Rect {
+                x: -width,
+                y: -1080,
+                width,
+                height: 2160,
+            };
+            for x in 0..width {
+                let (nx, _) = absolute(
+                    b,
+                    Point {
+                        x: (b.x + x) as f64,
+                        y: 0.0,
+                    },
                 );
+                assert_eq!((nx as i64 * width as i64 / 65536) as i32, x);
             }
         }
     }
     #[test]
-    fn screen_mode_scales_both_axes_with_source_and_target_resolution() {
-        for (sw, tw, expected) in [(1920, 1920, 100), (1920, 3840, 200), (3840, 1920, 50)] {
-            let source = DesktopBounds::new(0, 0, sw, sw);
-            let bounds = DesktopBounds::new(0, 0, tw, tw);
-            let mut capture = CaptureMotion::enter(source, true, 16384, MouseMode::ScreenRelative);
-            let mut target = PointerMotion::default();
-            target.enter(
-                bounds,
-                true,
-                16384,
+    fn source_fraction_and_small_deltas_survive_resolution_scaling() {
+        for (from, to) in [(1920, 3840), (3840, 1920)] {
+            let target = test_device(2, to, 2160);
+            let source = Rect {
+                x: 0,
+                y: 0,
+                width: from,
+                height: 1080,
+            };
+            let mut a = RemoteMotion::new(
+                source,
+                target.clone(),
+                Point { x: 100.0, y: 200.0 },
                 MouseMode::ScreenRelative,
-                source.entry_ratio(true),
             );
-            let MotionStep::MoveTo(before) = apply(&target, bounds, capture.advance(0, 0).unwrap())
-            else {
-                panic!()
-            };
-            let MotionStep::MoveTo(after) =
-                apply(&target, bounds, capture.advance(100, 100).unwrap())
-            else {
-                panic!()
-            };
-            assert_eq!(after.x - before.x, expected);
-            assert_eq!(after.y - before.y, expected);
-        }
-    }
-    #[test]
-    fn entering_different_screens_does_not_jump_on_the_first_move() {
-        for (width, height) in [(1920, 1080), (3840, 2160), (1366, 768)] {
-            for from_left in [true, false] {
-                for y in [0, 16384, 32768, 65535] {
-                    let source = DesktopBounds::new(0, 0, width, height);
-                    let bounds = DesktopBounds::new(-2560, -720, 7680, 2880);
-                    let mut capture =
-                        CaptureMotion::enter(source, from_left, y, MouseMode::ScreenRelative);
-                    let mut target = PointerMotion::default();
-                    let entry = target.enter(
-                        bounds,
-                        from_left,
-                        y,
-                        MouseMode::ScreenRelative,
-                        source.entry_ratio(from_left),
-                    );
-                    assert_eq!(
-                        apply(&target, bounds, capture.advance(0, 0).unwrap()),
-                        MotionStep::MoveTo(entry)
-                    );
-                }
+            let mut b = RemoteMotion::new(
+                source,
+                target,
+                Point { x: 100.0, y: 200.0 },
+                MouseMode::ScreenRelative,
+            );
+            for _ in 0..100 {
+                a.advance(1, 1);
             }
-        }
-    }
-
-    #[test]
-    fn one_pixel_motion_and_batching_preserve_source_position() {
-        let source = DesktopBounds::new(0, 0, 1920, 1080);
-        let bounds = DesktopBounds::new(-3840, -1080, 5760, 2160);
-        let mut small = CaptureMotion::enter(source, true, 32768, MouseMode::ScreenRelative);
-        let mut large = CaptureMotion::enter(source, true, 32768, MouseMode::ScreenRelative);
-        let mut target = PointerMotion::default();
-        let entry = target.enter(
-            bounds,
-            true,
-            32768,
-            MouseMode::ScreenRelative,
-            source.entry_ratio(true),
-        );
-        let mut last = Message::Ping;
-        for delta in 1..=500 {
-            last = small.advance(1, 0).unwrap();
-            let MotionStep::MoveTo(point) = apply(&target, bounds, last.clone()) else {
-                panic!()
-            };
-            assert_eq!(point.x, entry.x + delta * 3);
-        }
-        assert_eq!(last, large.advance(500, 0).unwrap());
-    }
-    #[test]
-    fn negative_desktop_origins_and_entry_height_are_preserved() {
-        let bounds = DesktopBounds::new(-3840, -1080, 5760, 2160);
-        let y = bounds.height_ratio(-540);
-        assert_eq!(bounds.entry(true, y), PixelPoint { x: -3836, y: -540 });
-        assert_eq!(bounds.entry(false, y), PixelPoint { x: 1915, y: -540 });
-        for point in [
-            PixelPoint { x: -3840, y: -1080 },
-            bounds.center(),
-            PixelPoint { x: 1919, y: 1079 },
-        ] {
-            let (x, y) = bounds.absolute(point);
-            assert_eq!(
-                bounds.left + (i64::from(x) * i64::from(bounds.width) / 65536) as i32,
-                point.x
-            );
-            assert_eq!(
-                bounds.top + (i64::from(y) * i64::from(bounds.height) / 65536) as i32,
-                point.y
-            );
+            b.advance(100, 100);
+            assert_eq!(a.point, b.point);
+            assert_eq!(a.point.x, 100.0 + 100.0 * to as f64 / from as f64);
+            assert_eq!(a.point.y, 400.0);
         }
     }
     #[test]
-    fn relative_mode_passes_deltas_instead_of_accumulating_absolute_positions() {
-        let mut capture = CaptureMotion::enter(
-            DesktopBounds::new(0, 0, 1920, 1080),
-            true,
-            32768,
-            MouseMode::Relative,
-        );
-        let mut target = PointerMotion::default();
-        let bounds = DesktopBounds::new(-3840, 0, 7680, 2160);
-        target.enter(bounds, true, 32768, MouseMode::Relative, 136);
-        for (dx, dy) in [(1, -1), (500, -200), (-32768, 32768)] {
-            assert_eq!(capture.advance(dx, dy).unwrap(), Message::Move { dx, dy });
-            target.relative(dx, dy).unwrap();
-        }
-        assert_eq!(
-            target.observe(bounds, PixelPoint { x: -3840, y: 540 }),
-            Some(16383)
-        );
-        assert_eq!(target.observe(bounds, PixelPoint { x: 3839, y: 540 }), None);
-    }
-    #[test]
-    fn only_entry_edge_returns_and_cooldown_can_defer_a_switch() {
-        let bounds = DesktopBounds::new(0, 0, 1920, 1080);
-        for from_left in [true, false] {
-            let mut target = PointerMotion::default();
-            target.enter(
-                bounds,
-                from_left,
-                16384,
-                MouseMode::ScreenRelative,
-                bounds.entry_ratio(from_left),
-            );
-            let (entry, opposite) = if from_left { (-1, 65536) } else { (65536, -1) };
-            assert_eq!(
-                target.absolute(bounds, entry, 16384, true).unwrap(),
-                MotionStep::ReturnLocal { y: 16384 }
-            );
-            assert!(matches!(
-                target.absolute(bounds, entry, 16384, false).unwrap(),
-                MotionStep::MoveTo(_)
-            ));
-            assert!(matches!(
-                target.absolute(bounds, opposite, 16384, true).unwrap(),
-                MotionStep::MoveTo(_)
-            ));
-        }
-    }
-    #[test]
-    fn stale_or_mismatched_modes_and_invalid_values_are_rejected() {
-        let bounds = DesktopBounds::new(0, 0, 1920, 1080);
-        let mut target = PointerMotion::default();
-        assert!(target.absolute(bounds, 1, 1, true).is_err());
-        assert!(target.relative(1, 1).is_err());
-        target.enter(bounds, true, 32768, MouseMode::ScreenRelative, 136);
-        assert!(target.relative(1, 1).is_err());
-        assert!(target.absolute(bounds, i32::MIN, 1, true).is_err());
-        assert!(target.absolute(bounds, 1, -1, true).is_err());
-        target.enter(bounds, true, 32768, MouseMode::Relative, 136);
-        assert!(target.relative(i32::MIN, 0).is_err());
-        assert!(target.absolute(bounds, 1, 1, true).is_err());
+    fn relative_mode_uses_observed_position_not_delta_accumulation() {
+        let d = test_device(1, 1920, 1080);
+        let mut m = RemoteMotion::new(d.bounds, d, Point { x: 10.0, y: 20.0 }, MouseMode::Relative);
+        assert_eq!(m.advance(100, 100), Point { x: 10.0, y: 20.0 });
     }
 }

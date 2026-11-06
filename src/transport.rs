@@ -190,7 +190,10 @@ mod tests {
     #[test]
     fn encrypted_transport_handles_fragmentation_and_both_directions() {
         let (mut client, mut server) = pair();
-        let expected = Message::Clipboard("中文剪贴板 🖱".into());
+        let expected = Message::DeliverClipboard {
+            source: "test".into(),
+            text: "中文剪贴板 🖱".into(),
+        };
         let frame = encode(&mut client, &expected).unwrap();
         assert!(!String::from_utf8_lossy(&frame).contains("剪贴板"));
         let mut incoming = Vec::new();
@@ -235,7 +238,10 @@ mod tests {
         let mut socket = TcpStream::connect(addr).unwrap();
         let mut client = handshake(&mut socket, &key, true).unwrap();
         let mut server = other.join().unwrap();
-        let expected = Message::Move { dx: 8, dy: -3 };
+        let expected = Message::Input {
+            epoch: 1,
+            event: crate::protocol::InputEvent::Relative { dx: 8, dy: -3 },
+        };
         let mut frame = encode(&mut client, &expected).unwrap();
         assert_eq!(
             decode_available(&mut server, &mut frame).unwrap(),
