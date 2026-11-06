@@ -3,9 +3,10 @@
 use anyhow::{Context, Result, ensure};
 use snow::{Builder, TransportState};
 use std::{
-    io::{Read, Write},
+    io::{self, ErrorKind, Read, Write},
     net::TcpStream,
-    time::Duration,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 use crate::protocol::Message;
@@ -19,9 +20,27 @@ pub fn handshake(
     key: &[u8; 32],
     initiator: bool,
 ) -> Result<TransportState> {
+    handshake_with_cancel(stream, key, initiator, None)
+}
+
+pub(crate) fn handshake_with_cancel(
+    stream: &mut TcpStream,
+    key: &[u8; 32],
+    initiator: bool,
+    stop: Option<&AtomicBool>,
+) -> Result<TransportState> {
+    // Accepted sockets can inherit nonblocking mode from the listener on
+    // Windows. The bounded handshake uses read_exact/write_all, then the
+    // session explicitly switches back to nonblocking IO.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+    let mut io = HandshakeIo {
+        stream,
+        stop,
+        deadline: Instant::now() + Duration::from_secs(3),
+    };
     let builder = Builder::new(PATTERN.parse()?)
         .prologue(PROLOGUE)?
         .psk(0, key)?;
@@ -33,20 +52,68 @@ pub fn handshake(
     let mut buf = [0u8; MAX_FRAME];
     if initiator {
         let len = state.write_message(&[], &mut buf)?;
-        write_frame(stream, &buf[..len])?;
-        let frame = read_frame(stream)?;
+        write_frame(&mut io, &buf[..len])?;
+        let frame = read_frame(&mut io)?;
         state
             .read_message(&frame, &mut buf)
             .context("配对失败，请检查两端密钥")?;
     } else {
-        let frame = read_frame(stream)?;
+        let frame = read_frame(&mut io)?;
         state
             .read_message(&frame, &mut buf)
             .context("配对失败，请检查两端密钥")?;
         let len = state.write_message(&[], &mut buf)?;
-        write_frame(stream, &buf[..len])?;
+        write_frame(&mut io, &buf[..len])?;
     }
     Ok(state.into_transport_mode()?)
+}
+
+// Winsock shutdown from another thread need not wake a blocking recv promptly.
+// Short socket timeouts let cancellation run; one total deadline also bounds a
+// peer that trickles a handshake frame one byte at a time.
+struct HandshakeIo<'a> {
+    stream: &'a mut TcpStream,
+    stop: Option<&'a AtomicBool>,
+    deadline: Instant,
+}
+
+impl HandshakeIo<'_> {
+    fn poll<T>(
+        &mut self,
+        mut operation: impl FnMut(&mut TcpStream) -> io::Result<T>,
+    ) -> io::Result<T> {
+        loop {
+            if self.stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+                return Err(io::Error::new(ErrorKind::ConnectionAborted, "连接已取消"));
+            }
+            if Instant::now() >= self.deadline {
+                return Err(io::Error::new(ErrorKind::TimedOut, "配对握手超时"));
+            }
+            match operation(self.stream) {
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Read for HandshakeIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.poll(|stream| stream.read(buf))
+    }
+}
+
+impl Write for HandshakeIo<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.poll(|stream| stream.write(buf))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.poll(Write::flush)
+    }
 }
 
 fn write_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {

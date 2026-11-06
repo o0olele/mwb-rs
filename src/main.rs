@@ -151,13 +151,13 @@ impl Workspace {
     }
 
     fn toggle_sharing(&mut self, cx: &mut Context<Self>) {
-        if self.runtime.enabled.load(Ordering::SeqCst) {
+        if self.runtime.sharing_enabled() {
             self.runtime.reclaim();
             self.notice = "已暂停共享，键鼠由本机控制".into();
         } else {
-            match platform::install_hooks(self.runtime.clone()) {
+            match platform::install_hooks(self.runtime.clone()).and_then(|()| self.runtime.resume())
+            {
                 Ok(()) => {
-                    self.runtime.enabled.store(true, Ordering::SeqCst);
                     self.notice = "共享已恢复，可从屏幕边缘切换到另一台电脑".into();
                 }
                 Err(err) => self.notice = format!("输入捕获启动失败：{err:#}"),
@@ -546,7 +546,7 @@ impl Workspace {
 
     fn sharing(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = self.runtime.snapshot().connected;
-        let enabled = self.runtime.enabled.load(Ordering::SeqCst);
+        let enabled = self.runtime.sharing_enabled();
         let remote = self.runtime.remote.load(Ordering::SeqCst);
         let incoming = self.runtime.incoming.load(Ordering::SeqCst);
         card()
@@ -691,6 +691,42 @@ impl Workspace {
                     })),
             ))
             .child(option_row(
+                "避开屏幕角落",
+                "开启后，左右边缘顶部和底部各 100 像素不触发切换或返回。手动控制不受影响。",
+                Button::new("block-corners-toggle")
+                    .label(if self.config.block_corners {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.config.block_corners = !this.config.block_corners;
+                        this.runtime
+                            .block_corners
+                            .store(this.config.block_corners, Ordering::SeqCst);
+                        this.persist();
+                        cx.notify();
+                    })),
+            ))
+            .child(option_row(
+                "自动重连",
+                "连接失败或中断后，主动连接端逐步延长间隔重试；暂停状态会保留。等待端持续监听。",
+                Button::new("auto-reconnect-toggle")
+                    .label(if self.config.auto_reconnect {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.config.auto_reconnect = !this.config.auto_reconnect;
+                        this.runtime
+                            .auto_reconnect
+                            .store(this.config.auto_reconnect, Ordering::SeqCst);
+                        this.persist();
+                        cx.notify();
+                    })),
+            ))
+            .child(option_row(
                 "共享键盘",
                 "键盘跟随鼠标；关闭后仅共享鼠标。",
                 Button::new("keyboard-toggle")
@@ -727,7 +763,7 @@ impl Workspace {
             .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("一套键鼠，两台电脑。"))
             .child(subtle(format!("MWB Rust · {} 预览版", env!("CARGO_PKG_VERSION"))))
             .child(div().text_sm().child("以 Rust + GPUI Kit 重写 Mouse without Borders 的核心使用流程。"))
-            .child(div().text_sm().child("当前支持：两台 Windows 电脑直连、屏幕比例 / 相对鼠标移动、密钥配对、加密键鼠传输、左右越界切换、手动发送文本剪贴板。"))
+            .child(div().text_sm().child("当前支持：两台 Windows 电脑直连、自动重连、屏幕比例 / 相对鼠标移动、密钥配对、加密键鼠传输、左右越界切换、角落避让、手动发送文本剪贴板。"))
             .child(div().text_sm().child("后续计划：自动发现、多设备布局、文件传输、托盘与后台服务。"))
             .child(div().text_sm().child("两端均需运行本重写版。普通用户权限下运行，当前不支持 UAC 安全桌面。"))
             .child(div().text_xs().text_color(rgb(MUTED)).child("Native UI · GPUI Kit 0.8.1  /  Transport · Noise + ChaCha20-Poly1305"))
@@ -787,6 +823,8 @@ impl Render for Workspace {
                                     )
                                     .child(if state.connected {
                                         "设备已连接"
+                                    } else if state.reconnecting {
+                                        "等待自动重连"
                                     } else if state.listening {
                                         "等待设备连接"
                                     } else {

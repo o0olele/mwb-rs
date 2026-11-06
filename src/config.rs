@@ -13,6 +13,8 @@ pub struct Config {
     pub edge_switch: bool,
     pub keyboard: bool,
     pub relative_mouse: bool,
+    pub auto_reconnect: bool,
+    pub block_corners: bool,
 }
 
 impl Default for Config {
@@ -25,6 +27,8 @@ impl Default for Config {
             edge_switch: true,
             keyboard: true,
             relative_mouse: false,
+            auto_reconnect: true,
+            block_corners: false,
         }
     }
 }
@@ -121,9 +125,16 @@ mod tests {
         let config: Config = serde_json::from_str(r#"{"port":24810,"keyboard":false}"#).unwrap();
         assert!(!config.relative_mouse);
         assert!(!config.keyboard);
+        assert!(config.auto_reconnect);
+        assert!(!config.block_corners);
         let mut config = config;
         config.relative_mouse = true;
+        config.auto_reconnect = false;
+        config.block_corners = true;
         let saved = serde_json::to_vec(&config).unwrap();
+        let restored: Config = serde_json::from_slice(&saved).unwrap();
+        assert!(!restored.auto_reconnect);
+        assert!(restored.block_corners);
         assert!(
             serde_json::from_slice::<Config>(&saved)
                 .unwrap()

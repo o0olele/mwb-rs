@@ -30,6 +30,20 @@ impl DesktopBounds {
     pub fn right(self) -> i32 {
         self.left.saturating_add(self.width - 1)
     }
+    pub fn outside_corner(self, y: i32, block_corners: bool) -> bool {
+        // The current layout has only left/right neighbours. Reserve 100
+        // physical pixels at both ends of those edges when the option is on.
+        !block_corners
+            || (i64::from(y) - i64::from(self.top) >= 100
+                && i64::from(self.top) + i64::from(self.height) - 1 - i64::from(y) >= 100)
+    }
+    pub fn crosses_edge(self, point: PixelPoint, right: bool, block_corners: bool) -> bool {
+        (if right {
+            point.x >= self.right()
+        } else {
+            point.x <= self.left
+        }) && self.outside_corner(point.y, block_corners)
+    }
     pub fn center(self) -> PixelPoint {
         PixelPoint {
             x: self.left.saturating_add(self.width / 2),
@@ -188,6 +202,41 @@ impl PointerMotion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corner_guard_reserves_100_physical_pixels_at_both_edge_ends() {
+        for bounds in [
+            DesktopBounds::new(0, 0, 1920, 1080),
+            DesktopBounds::new(-3840, -2160, 3840, 2160),
+        ] {
+            for right in [false, true] {
+                let x = if right { bounds.right() } else { bounds.left };
+                for offset in [0, 99, bounds.height - 100, bounds.height - 1] {
+                    let point = PixelPoint {
+                        x,
+                        y: bounds.top + offset,
+                    };
+                    assert!(!bounds.crosses_edge(point, right, true));
+                    assert!(bounds.crosses_edge(point, right, false));
+                }
+                for offset in [100, bounds.height / 2, bounds.height - 101] {
+                    let point = PixelPoint {
+                        x,
+                        y: bounds.top + offset,
+                    };
+                    assert!(bounds.crosses_edge(point, right, true));
+                    let inside = PixelPoint {
+                        x: x + if right { -1 } else { 1 },
+                        ..point
+                    };
+                    assert!(!bounds.crosses_edge(inside, right, true));
+                    assert!(!bounds.crosses_edge(inside, right, false));
+                }
+            }
+        }
+        // Tiny desktops have no unprotected edge; manual control still works.
+        assert!(!DesktopBounds::new(0, 0, 10, 10).outside_corner(5, true));
+    }
     fn apply(target: &PointerMotion, bounds: DesktopBounds, msg: Message) -> MotionStep {
         let Message::MoveAbsolute { x, y } = msg else {
             panic!("expected screen coordinates")

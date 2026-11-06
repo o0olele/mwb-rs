@@ -24,6 +24,7 @@ use crate::{
 pub struct Status {
     pub listening: bool,
     pub connected: bool,
+    pub reconnecting: bool,
     pub peer_name: String,
     pub address: String,
     pub detail: String,
@@ -35,12 +36,15 @@ pub struct Runtime {
     pub running: AtomicBool,
     pub stop: AtomicBool,
     pub enabled: AtomicBool,
+    paused: AtomicBool,
     pub remote: AtomicBool,
     pub incoming: AtomicBool,
     pub keyboard: AtomicBool,
     pub edge: AtomicBool,
     pub right: AtomicBool,
     pub relative_mouse: AtomicBool,
+    pub auto_reconnect: AtomicBool,
+    pub block_corners: AtomicBool,
     pub(crate) capture_epoch: AtomicU64,
     pub(crate) capture_y: AtomicU16,
     pub(crate) capture_relative: AtomicBool,
@@ -50,6 +54,7 @@ pub struct Runtime {
     pub sent: AtomicU64,
     pub received: AtomicU64,
     outgoing: Mutex<Option<SyncSender<Message>>>,
+    active_socket: Mutex<Option<TcpStream>>,
 }
 
 impl Runtime {
@@ -62,12 +67,15 @@ impl Runtime {
             running: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             enabled: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             remote: AtomicBool::new(false),
             incoming: AtomicBool::new(false),
             keyboard: AtomicBool::new(config.keyboard),
             edge: AtomicBool::new(config.edge_switch),
             right: AtomicBool::new(config.peer_on_right),
             relative_mouse: AtomicBool::new(config.relative_mouse),
+            auto_reconnect: AtomicBool::new(config.auto_reconnect),
+            block_corners: AtomicBool::new(config.block_corners),
             capture_epoch: AtomicU64::new(0),
             capture_y: AtomicU16::new(32768),
             capture_relative: AtomicBool::new(false),
@@ -77,6 +85,7 @@ impl Runtime {
             sent: AtomicU64::new(0),
             received: AtomicU64::new(0),
             outgoing: Mutex::new(None),
+            active_socket: Mutex::new(None),
         })
     }
 
@@ -98,9 +107,13 @@ impl Runtime {
             self.fail_open();
             return false;
         };
-        if let Some(tx) = guard.as_ref()
-            && tx.try_send(msg).is_ok()
-        {
+        let Some(tx) = guard.as_ref() else {
+            // Offline settings changes and local returns are not queue failures.
+            self.remote.store(false, Ordering::SeqCst);
+            self.enabled.store(false, Ordering::SeqCst);
+            return false;
+        };
+        if tx.try_send(msg).is_ok() {
             return true;
         }
         self.fail_open();
@@ -108,6 +121,7 @@ impl Runtime {
     }
 
     fn fail_open(&self) {
+        self.paused.store(true, Ordering::SeqCst);
         self.remote.store(false, Ordering::SeqCst);
         self.enabled.store(false, Ordering::SeqCst);
         self.abort.store(true, Ordering::SeqCst);
@@ -133,7 +147,7 @@ impl Runtime {
     }
 
     pub(crate) fn begin_control(&self, x: u16, y: u16) -> bool {
-        if !self.enabled.load(Ordering::SeqCst)
+        if !self.sharing_enabled()
             || self.incoming.load(Ordering::SeqCst)
             || self.remote.load(Ordering::SeqCst)
             || !self.can_switch()
@@ -159,13 +173,35 @@ impl Runtime {
     }
 
     pub fn reclaim(&self) {
+        self.paused.store(true, Ordering::SeqCst);
         self.enabled.store(false, Ordering::SeqCst);
         self.return_local();
+    }
+
+    pub fn resume(&self) -> Result<()> {
+        ensure!(
+            self.snapshot().connected
+                && !self.stop.load(Ordering::SeqCst)
+                && !self.abort.load(Ordering::SeqCst),
+            "请先连接另一台电脑"
+        );
+        self.paused.store(false, Ordering::SeqCst);
+        self.enabled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn sharing_enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+            && !self.paused.load(Ordering::SeqCst)
+            && !self.stop.load(Ordering::SeqCst)
     }
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         self.reclaim();
+        if let Some(socket) = self.active_socket.lock().unwrap().as_ref() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
     }
 }
 
@@ -180,50 +216,159 @@ pub fn start(
     key: [u8; 32],
     target: Option<String>,
 ) -> Result<()> {
+    start_with_input(runtime, config, key, target, Injector::default())
+}
+
+fn start_with_input(
+    runtime: Arc<Runtime>,
+    config: Config,
+    key: [u8; 32],
+    target: Option<String>,
+    mut injector: impl SessionInput + Send + 'static,
+) -> Result<()> {
     ensure!(
-        !runtime.running.load(Ordering::SeqCst),
+        runtime
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok(),
         "连接正在运行，请先停止"
     );
     // Bind synchronously so a port conflict is reported before the UI says it is listening.
-    let listener =
-        TcpListener::bind(("0.0.0.0", config.port)).context("无法监听端口，可能已被占用")?;
-    listener.set_nonblocking(true)?;
+    let listener = (|| -> Result<_> {
+        let listener =
+            TcpListener::bind(("0.0.0.0", config.port)).context("无法监听端口，可能已被占用")?;
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    })();
+    let listener = match listener {
+        Ok(listener) => listener,
+        Err(err) => {
+            runtime.running.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+    };
     runtime.stop.store(false, Ordering::SeqCst);
     runtime.abort.store(false, Ordering::SeqCst);
-    runtime.running.store(true, Ordering::SeqCst);
+    // An explicit start is a new pairing run. Automatic retries never clear pause.
+    runtime.paused.store(false, Ordering::SeqCst);
+    runtime.emergency.store(false, Ordering::SeqCst);
     runtime.status.lock().unwrap().listening = true;
     runtime.log(format!("正在监听 TCP {}，等待另一台电脑", config.port));
     let rt = runtime.clone();
     thread::spawn(move || {
-        if let Some(target) = target {
-            match connect(&target, config.port) {
-                Ok(stream) => run_session(&rt, stream, &config, &key, true),
-                Err(err) => rt.log(format!("连接失败：{err:#}")),
-            }
-        }
+        let mut retry = RetrySchedule::default();
         while !rt.stop.load(Ordering::SeqCst) {
+            let automatic = rt.auto_reconnect.load(Ordering::SeqCst);
+            if let Some(target) = target.as_deref()
+                && retry.ready(Instant::now(), automatic)
+            {
+                rt.status.lock().unwrap().reconnecting = retry.attempts > 0;
+                rt.log(format!("正在连接 {target}…"));
+                let outcome = match connect(target, config.port, &rt.stop) {
+                    Ok(stream) => {
+                        run_session_with_input(&rt, stream, &config, &key, true, &mut injector)
+                    }
+                    Err(err) => {
+                        rt.log(format!("连接失败：{err:#}"));
+                        SessionOutcome {
+                            established: false,
+                            retry: true,
+                        }
+                    }
+                };
+                retry.after_session(outcome, Instant::now());
+                report_retry(&rt, &retry, target);
+            }
+            if rt.stop.load(Ordering::SeqCst) {
+                break;
+            }
             match listener.accept() {
-                Ok((stream, _)) => run_session(&rt, stream, &config, &key, false),
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20))
+                Ok((stream, _)) => {
+                    let outcome =
+                        run_session_with_input(&rt, stream, &config, &key, false, &mut injector);
+                    // An unauthenticated inbound connection must not cancel the
+                    // user's pending outbound retry or change its backoff.
+                    if outcome.established
+                        && let Some(target) = target.as_deref()
+                    {
+                        retry.after_session(outcome, Instant::now());
+                        report_retry(&rt, &retry, target);
+                    }
                 }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
                 Err(err) => {
                     rt.log(format!("监听失败：{err}"));
                     break;
                 }
             }
+            rt.status.lock().unwrap().reconnecting = target.is_some()
+                && !retry.blocked
+                && retry.attempts > 0
+                && rt.auto_reconnect.load(Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(20));
         }
         rt.enabled.store(false, Ordering::SeqCst);
         rt.remote.store(false, Ordering::SeqCst);
         rt.incoming.store(false, Ordering::SeqCst);
-        rt.status.lock().unwrap().listening = false;
-        rt.running.store(false, Ordering::SeqCst);
+        {
+            let mut status = rt.status.lock().unwrap();
+            status.listening = false;
+            status.reconnecting = false;
+        }
         rt.log("连接已停止");
+        rt.running.store(false, Ordering::SeqCst);
     });
     Ok(())
 }
 
-fn connect(target: &str, port: u16) -> Result<TcpStream> {
+struct SessionOutcome {
+    established: bool,
+    retry: bool,
+}
+
+#[derive(Default)]
+struct RetrySchedule {
+    attempts: u32,
+    due: Option<Instant>,
+    blocked: bool,
+}
+
+impl RetrySchedule {
+    fn ready(&self, now: Instant, automatic: bool) -> bool {
+        !self.blocked
+            && (self.attempts == 0 || (automatic && self.due.is_some_and(|due| now >= due)))
+    }
+
+    fn after_session(&mut self, outcome: SessionOutcome, now: Instant) {
+        if outcome.established {
+            self.attempts = 0;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        self.blocked = !outcome.retry;
+        self.due = Some(now + self.delay());
+    }
+
+    fn delay(&self) -> Duration {
+        Duration::from_secs((1u64 << self.attempts.saturating_sub(1).min(5)).min(30))
+    }
+}
+
+fn report_retry(rt: &Runtime, retry: &RetrySchedule, target: &str) {
+    if rt.stop.load(Ordering::SeqCst) {
+        return;
+    }
+    if retry.blocked {
+        rt.log("自动重连已停止：请检查配对密钥或两端版本，停止连接后重试（详见连接记录）");
+    } else if rt.auto_reconnect.load(Ordering::SeqCst) {
+        rt.log(format!(
+            "{} 秒后重连 {target}（第 {} 次），可点击停止连接取消",
+            retry.delay().as_secs(),
+            retry.attempts
+        ));
+    }
+}
+
+fn connect(target: &str, port: u16, stop: &AtomicBool) -> Result<TcpStream> {
     let addresses: Vec<SocketAddr> = if target.parse::<std::net::IpAddr>().is_ok() {
         (target, port).to_socket_addrs()?.collect()
     } else if target.contains(':') {
@@ -232,6 +377,7 @@ fn connect(target: &str, port: u16) -> Result<TcpStream> {
         (target, port).to_socket_addrs()?.collect()
     };
     for addr in addresses {
+        ensure!(!stop.load(Ordering::SeqCst), "连接已取消");
         if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
             return Ok(stream);
         }
@@ -239,25 +385,23 @@ fn connect(target: &str, port: u16) -> Result<TcpStream> {
     bail!("无法连接 {target}；请确认对方已启动监听、地址正确且防火墙允许 TCP {port}")
 }
 
-fn run_session(
-    rt: &Arc<Runtime>,
-    stream: TcpStream,
-    config: &Config,
-    key: &[u8; 32],
-    initiator: bool,
-) {
-    let mut injector = Injector::default();
-    run_session_with_input(rt, stream, config, key, initiator, &mut injector);
-}
-
 // Keep network/control tests on the production state machine without installing
 // global hooks or moving the real desktop pointer in a test process.
 trait SessionInput {
     fn enable(&mut self, runtime: Arc<Runtime>) -> Result<()>;
     fn enter(&mut self, from_left: bool, x: u16, y: u16, mode: MouseMode) -> Result<()>;
-    fn apply(&mut self, message: Message, keyboard: bool) -> Result<Option<u16>>;
-    fn poll_return(&mut self) -> Result<Option<u16>> {
+    fn apply(
+        &mut self,
+        message: Message,
+        keyboard: bool,
+        block_corners: bool,
+    ) -> Result<Option<u16>>;
+    fn poll_return(&mut self, _block_corners: bool) -> Result<Option<u16>> {
         Ok(None)
+    }
+    fn set_clipboard(&mut self, text: String) -> Result<()> {
+        arboard::Clipboard::new()?.set_text(text)?;
+        Ok(())
     }
     fn return_cursor(&mut self, peer_on_right: bool, y: u16) -> Result<()>;
     fn release_all(&mut self);
@@ -271,11 +415,16 @@ impl SessionInput for Injector {
     fn enter(&mut self, from_left: bool, x: u16, y: u16, mode: MouseMode) -> Result<()> {
         Injector::enter(self, from_left, x, y, mode)
     }
-    fn apply(&mut self, message: Message, keyboard: bool) -> Result<Option<u16>> {
-        Injector::apply(self, message, keyboard)
+    fn apply(
+        &mut self,
+        message: Message,
+        keyboard: bool,
+        block_corners: bool,
+    ) -> Result<Option<u16>> {
+        Injector::apply(self, message, keyboard, block_corners)
     }
-    fn poll_return(&mut self) -> Result<Option<u16>> {
-        Injector::poll_return(self)
+    fn poll_return(&mut self, block_corners: bool) -> Result<Option<u16>> {
+        Injector::poll_return(self, block_corners)
     }
     fn return_cursor(&mut self, peer_on_right: bool, y: u16) -> Result<()> {
         Injector::return_cursor(self, peer_on_right, y)
@@ -297,10 +446,13 @@ fn run_session_with_input(
     key: &[u8; 32],
     initiator: bool,
     injector: &mut impl SessionInput,
-) {
+) -> SessionOutcome {
     rt.log("正在验证配对密钥…");
     let result = (|| -> Result<()> {
-        let mut noise = transport::handshake(&mut stream, key, initiator)?;
+        *rt.active_socket.lock().unwrap() = Some(stream.try_clone()?);
+        ensure!(!rt.stop.load(Ordering::SeqCst), "连接已取消");
+        let mut noise =
+            transport::handshake_with_cancel(&mut stream, key, initiator, Some(&rt.stop))?;
         ensure!(!rt.stop.load(Ordering::SeqCst), "连接已取消");
         stream.set_nonblocking(true)?;
         let address = stream.peer_addr()?.to_string();
@@ -313,13 +465,26 @@ fn run_session_with_input(
     rt.remote.store(false, Ordering::SeqCst);
     rt.incoming.store(false, Ordering::SeqCst);
     *rt.outgoing.lock().unwrap() = None;
+    *rt.active_socket.lock().unwrap() = None;
     injector.release_all();
-    rt.status.lock().unwrap().connected = false;
+    let established = {
+        let mut status = rt.status.lock().unwrap();
+        let established = status.connected;
+        status.connected = false;
+        established
+    };
+    // IO loss/timeout and fail-open queue aborts may retry. Authentication,
+    // framing and protocol errors need user attention, never a tight retry loop.
+    let retry = result
+        .as_ref()
+        .err()
+        .is_none_or(|err| err.is::<std::io::Error>());
     let _ = stream.shutdown(Shutdown::Both);
     match result {
         Ok(()) => rt.log("已断开，控制权已回到本机"),
         Err(err) => rt.log(format!("连接结束：{err:#}")),
     }
+    SessionOutcome { established, retry }
 }
 
 fn session(
@@ -348,8 +513,8 @@ fn session(
         if rt.emergency.swap(false, Ordering::SeqCst) {
             injector.release_all();
         }
-        if rt.enabled.load(Ordering::SeqCst) && rt.incoming.load(Ordering::SeqCst) {
-            let result = injector.poll_return();
+        if rt.sharing_enabled() && rt.incoming.load(Ordering::SeqCst) {
+            let result = injector.poll_return(rt.block_corners.load(Ordering::SeqCst));
             if let Some(Some(y)) = input_result(rt, injector, result)? {
                 finish_return(rt, injector, y);
             }
@@ -368,14 +533,16 @@ fn session(
         }
         if written < pending.len() {
             match stream.write(&pending[written..]) {
-                Ok(0) => bail!("对方已断开"),
+                Ok(0) => {
+                    return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "对方已断开").into());
+                }
                 Ok(n) => written += n,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
             }
         }
         match stream.read(&mut buffer) {
-            Ok(0) => bail!("对方已断开"),
+            Ok(0) => return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "对方已断开").into()),
             Ok(n) => {
                 incoming.extend_from_slice(&buffer[..n]);
                 for msg in transport::decode_available(noise, &mut incoming)? {
@@ -388,15 +555,31 @@ fn session(
                                 "两端协议版本不同，请将两台电脑都更新到 0.2.0 或更高版本"
                             );
                             ensure!(name.len() <= 256, "设备名称过长");
-                            let input_result = injector.enable(rt.clone());
+                            let input_result = if rt.paused.load(Ordering::SeqCst) {
+                                Ok(())
+                            } else {
+                                injector.enable(rt.clone())
+                            };
+                            if input_result.is_err() {
+                                rt.paused.store(true, Ordering::SeqCst);
+                            }
                             rt.enabled.store(input_result.is_ok(), Ordering::SeqCst);
+                            // Recheck after enabling so a concurrent emergency
+                            // return cannot be undone by handshake completion.
+                            if rt.paused.load(Ordering::SeqCst) {
+                                rt.enabled.store(false, Ordering::SeqCst);
+                            }
                             {
                                 let mut s = rt.status.lock().unwrap();
                                 s.connected = true;
+                                s.reconnecting = false;
                                 s.peer_name = name.clone();
                                 s.address = address.clone();
                             }
                             match input_result {
+                                Ok(()) if rt.paused.load(Ordering::SeqCst) => rt.log(format!(
+                                    "已连接到 {name}，共享保持暂停；点击恢复共享继续"
+                                )),
                                 Ok(()) => rt.log(format!("已连接到 {name}，键鼠共享已自动开启")),
                                 Err(err) => {
                                     rt.log(format!("已连接到 {name}，自动开启共享失败：{err:#}"))
@@ -429,26 +612,31 @@ fn session(
                             x,
                             y,
                             mode,
-                        } if rt.enabled.load(Ordering::SeqCst) => {
+                        } if rt.sharing_enabled() => {
                             rt.block_switch();
                             rt.remote.store(false, Ordering::SeqCst);
                             rt.incoming.store(true, Ordering::SeqCst);
                             let result = injector.enter(from_left, x, y, mode);
                             input_result(rt, injector, result)?;
                         }
-                        Message::Clipboard(text) if rt.enabled.load(Ordering::SeqCst) => {
+                        Message::Clipboard(text) if rt.sharing_enabled() => {
                             ensure!(text.len() <= MAX_TEXT_BYTES, "剪贴板文本超过 32 KB");
-                            arboard::Clipboard::new()?.set_text(text)?;
-                            rt.log("已收到对方发送的剪贴板文本");
+                            match injector.set_clipboard(text) {
+                                Ok(()) => rt.log("已收到对方发送的剪贴板文本"),
+                                Err(err) => {
+                                    rt.log(format!("写入剪贴板失败，连接保持，可重新发送：{err:#}"))
+                                }
+                            }
                         }
                         Message::Enter { .. } => {
                             rt.send(Message::Leave);
                         }
-                        other
-                            if rt.enabled.load(Ordering::SeqCst)
-                                && rt.incoming.load(Ordering::SeqCst) =>
-                        {
-                            let result = injector.apply(other, rt.keyboard.load(Ordering::SeqCst));
+                        other if rt.sharing_enabled() && rt.incoming.load(Ordering::SeqCst) => {
+                            let result = injector.apply(
+                                other,
+                                rt.keyboard.load(Ordering::SeqCst),
+                                rt.block_corners.load(Ordering::SeqCst),
+                            );
                             if let Some(Some(y)) = input_result(rt, injector, result)? {
                                 finish_return(rt, injector, y);
                             }
@@ -460,10 +648,11 @@ fn session(
             Err(e) if e.kind() == ErrorKind::WouldBlock => {}
             Err(e) => return Err(e.into()),
         }
-        ensure!(
-            last_receive.elapsed() < Duration::from_secs(5),
-            "连接超时，已释放所有按键"
-        );
+        if last_receive.elapsed() >= Duration::from_secs(5) {
+            return Err(
+                std::io::Error::new(ErrorKind::TimedOut, "连接超时，已释放所有按键").into(),
+            );
+        }
         thread::sleep(Duration::from_millis(2));
     }
     Ok(())
@@ -511,6 +700,8 @@ mod tests {
         fail_enter: AtomicBool,
         fail_apply: AtomicBool,
         fail_return: AtomicBool,
+        fail_clipboard: AtomicBool,
+        clipboard: Mutex<Vec<String>>,
     }
 
     struct TestInput {
@@ -545,13 +736,16 @@ mod tests {
             self.probe.enters.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn apply(&mut self, message: Message, _: bool) -> Result<Option<u16>> {
+        fn apply(&mut self, message: Message, _: bool, block_corners: bool) -> Result<Option<u16>> {
             if self.probe.fail_apply.load(Ordering::SeqCst) {
                 return Err(InputInjectionError::new("键盘", 0, 5).into());
             }
             let result = match message {
                 Message::MoveAbsolute { x, y } => {
-                    match self.motion.absolute(self.bounds, x, y, true)? {
+                    let can_return = self
+                        .bounds
+                        .outside_corner(self.bounds.point_at(x, y).y, block_corners);
+                    match self.motion.absolute(self.bounds, x, y, can_return)? {
                         MotionStep::MoveTo(point) => {
                             self.probe.positions.lock().unwrap().push(point);
                             None
@@ -568,8 +762,19 @@ mod tests {
             self.probe.events.lock().unwrap().push(message);
             Ok(result)
         }
-        fn poll_return(&mut self) -> Result<Option<u16>> {
-            Ok(self.probe.return_y.lock().unwrap().take())
+        fn poll_return(&mut self, block_corners: bool) -> Result<Option<u16>> {
+            Ok(self.probe.return_y.lock().unwrap().take().filter(|y| {
+                self.bounds
+                    .outside_corner(self.bounds.point_at(0, i32::from(*y)).y, block_corners)
+            }))
+        }
+        fn set_clipboard(&mut self, text: String) -> Result<()> {
+            ensure!(
+                !self.probe.fail_clipboard.load(Ordering::SeqCst),
+                "模拟剪贴板被占用"
+            );
+            self.probe.clipboard.lock().unwrap().push(text);
+            Ok(())
         }
         fn return_cursor(&mut self, peer_on_right: bool, y: u16) -> Result<()> {
             if self.probe.fail_return.load(Ordering::SeqCst) {
@@ -688,6 +893,296 @@ mod tests {
             x: if from_left { 136 } else { 65364 },
             y: 32768,
             mode: MouseMode::Relative,
+        }
+    }
+
+    fn test_input(probe: Arc<InputProbe>) -> TestInput {
+        TestInput {
+            probe,
+            fail_enable: false,
+            motion: PointerMotion::default(),
+            bounds: DesktopBounds::new(0, 0, 1920, 1080),
+        }
+    }
+
+    fn accept_socket(listener: &TcpListener) -> TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let mut stream = None;
+        wait_until(|| match listener.accept() {
+            Ok((accepted, _)) => {
+                stream = Some(accepted);
+                true
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => false,
+            Err(err) => panic!("accept failed: {err}"),
+        });
+        stream.unwrap()
+    }
+
+    struct ReconnectingClient {
+        runtime: Arc<Runtime>,
+        input: Arc<InputProbe>,
+        peers: Vec<(Arc<Runtime>, thread::JoinHandle<()>)>,
+    }
+
+    impl ReconnectingClient {
+        fn new(address: SocketAddr, automatic: bool) -> Self {
+            let config = Config {
+                port: 0,
+                auto_reconnect: automatic,
+                ..Config::default()
+            };
+            let runtime = Runtime::new(&config);
+            let input = Arc::new(InputProbe::default());
+            start_with_input(
+                runtime.clone(),
+                config,
+                [23; 32],
+                Some(address.to_string()),
+                test_input(input.clone()),
+            )
+            .unwrap();
+            Self {
+                runtime,
+                input,
+                peers: Vec::new(),
+            }
+        }
+
+        fn accept_peer(&mut self, listener: &TcpListener) -> Arc<Runtime> {
+            let stream = accept_socket(listener);
+            let config = Config::default();
+            let runtime = Runtime::new(&config);
+            let rt = runtime.clone();
+            let worker = thread::spawn(move || {
+                run_session_with_input(
+                    &rt,
+                    stream,
+                    &config,
+                    &[23; 32],
+                    false,
+                    &mut test_input(Arc::new(InputProbe::default())),
+                );
+            });
+            self.peers.push((runtime.clone(), worker));
+            wait_until(|| self.runtime.snapshot().connected && runtime.snapshot().connected);
+            runtime
+        }
+    }
+
+    impl Drop for ReconnectingClient {
+        fn drop(&mut self) {
+            self.runtime.stop();
+            for (peer, worker) in self.peers.drain(..) {
+                peer.stop();
+                worker.join().unwrap();
+            }
+            wait_until(|| !self.runtime.running.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn retry_backoff_is_bounded_resets_after_success_and_blocks_protocol_errors() {
+        let mut retry = RetrySchedule::default();
+        let now = Instant::now();
+        assert!(retry.ready(now, false)); // Explicit first attempt always runs.
+        for seconds in [1, 2, 4, 8, 16, 30, 30] {
+            retry.after_session(
+                SessionOutcome {
+                    established: false,
+                    retry: true,
+                },
+                now,
+            );
+            assert_eq!(retry.delay(), Duration::from_secs(seconds));
+            assert!(!retry.ready(now, true));
+            assert!(retry.ready(now + retry.delay(), true));
+            assert!(!retry.ready(now + retry.delay(), false));
+        }
+        retry.after_session(
+            SessionOutcome {
+                established: true,
+                retry: true,
+            },
+            now,
+        );
+        assert_eq!(retry.delay(), Duration::from_secs(1));
+        retry.after_session(
+            SessionOutcome {
+                established: false,
+                retry: false,
+            },
+            now,
+        );
+        assert!(!retry.ready(now + Duration::from_secs(60), true));
+    }
+
+    #[test]
+    fn reconnect_restores_normal_sharing_but_preserves_explicit_pause() {
+        for paused in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = ReconnectingClient::new(listener.local_addr().unwrap(), true);
+            let peer = client.accept_peer(&listener);
+            assert!(client.runtime.enabled.load(Ordering::SeqCst));
+            assert!(peer.begin_control(136, 32768));
+            assert!(peer.send(Message::Key {
+                vk: 65,
+                scan: 30,
+                extended: false,
+                down: true
+            }));
+            wait_until(|| !client.input.events.lock().unwrap().is_empty());
+            let releases = client.input.releases.load(Ordering::SeqCst);
+            if paused {
+                client.runtime.reclaim();
+            }
+            peer.stop();
+            wait_until(|| !client.runtime.snapshot().connected);
+            assert!(!client.runtime.remote.load(Ordering::SeqCst));
+            assert!(!client.runtime.incoming.load(Ordering::SeqCst));
+            assert!(client.input.releases.load(Ordering::SeqCst) > releases);
+            let next = client.accept_peer(&listener);
+            assert_eq!(client.runtime.enabled.load(Ordering::SeqCst), !paused);
+            assert_eq!(
+                client.input.enables.load(Ordering::SeqCst),
+                if paused { 1 } else { 2 }
+            );
+            if paused {
+                assert!(client.runtime.snapshot().detail.contains("共享保持暂停"));
+                assert!(next.begin_control(136, 32768));
+                wait_until(|| !next.remote.load(Ordering::SeqCst));
+                assert!(!client.runtime.incoming.load(Ordering::SeqCst));
+                client.runtime.resume().unwrap();
+            }
+            wait_until(|| next.can_switch());
+            assert!(next.begin_control(136, 32768));
+            wait_until(|| client.runtime.incoming.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn failed_initial_connect_can_retry_when_preference_is_enabled_and_stop_cancels_wait() {
+        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let mut client = ReconnectingClient::new(address, false);
+        wait_until(|| client.runtime.snapshot().detail.contains("连接失败"));
+        let listener = TcpListener::bind(address).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(1100));
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        client.runtime.auto_reconnect.store(true, Ordering::SeqCst);
+        let peer = client.accept_peer(&listener);
+        peer.stop();
+        wait_until(|| client.runtime.snapshot().reconnecting);
+        client.runtime.stop();
+        wait_until(|| !client.runtime.running.load(Ordering::SeqCst));
+        assert!(!client.runtime.snapshot().reconnecting);
+        assert!(!client.runtime.snapshot().listening);
+        thread::sleep(Duration::from_millis(1100));
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stop_interrupts_an_incomplete_noise_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = ReconnectingClient::new(listener.local_addr().unwrap(), true);
+        let _silent_peer = accept_socket(&listener);
+        wait_until(|| client.runtime.active_socket.lock().unwrap().is_some());
+        let stopped_at = Instant::now();
+        client.runtime.stop();
+        wait_until(|| !client.runtime.running.load(Ordering::SeqCst));
+        assert!(stopped_at.elapsed() < Duration::from_secs(2));
+        assert_eq!(client.input.enables.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn protocol_failure_stops_outbound_retries_without_enabling_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = ReconnectingClient::new(listener.local_addr().unwrap(), true);
+        let mut socket = accept_socket(&listener);
+        let mut noise = transport::handshake(&mut socket, &[23; 32], false).unwrap();
+        let frame = transport::encode(
+            &mut noise,
+            &Message::Hello {
+                version: 1,
+                name: "old-peer".into(),
+            },
+        )
+        .unwrap();
+        socket.write_all(&frame).unwrap();
+        wait_until(|| client.runtime.snapshot().detail.contains("自动重连已停止"));
+        thread::sleep(Duration::from_millis(1100));
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert_eq!(client.input.enables.load(Ordering::SeqCst), 0);
+        assert!(!client.runtime.snapshot().reconnecting);
+    }
+
+    #[test]
+    fn offline_local_return_is_not_a_queue_failure() {
+        let rt = Runtime::new(&Config::default());
+        rt.return_local();
+        assert!(!rt.abort.load(Ordering::SeqCst));
+        assert!(!rt.paused.load(Ordering::SeqCst));
+        assert!(!rt.send(Message::Ping));
+        assert!(rt.resume().is_err());
+        // A control request racing with disconnect must not leave remote=true.
+        rt.enabled.store(true, Ordering::SeqCst);
+        wait_until(|| rt.can_switch());
+        assert!(!rt.begin_control(136, 32768));
+        assert!(!rt.remote.load(Ordering::SeqCst));
+        assert!(!rt.sharing_enabled());
+        assert!(!rt.paused.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn clipboard_failure_keeps_the_input_session_usable() {
+        let pair = Loopback::new(false);
+        pair.b_input.fail_clipboard.store(true, Ordering::SeqCst);
+        assert!(pair.a.send(Message::Clipboard("first".into())));
+        wait_until(|| pair.b.snapshot().detail.contains("写入剪贴板失败"));
+        assert!(pair.b.snapshot().connected && pair.b.enabled.load(Ordering::SeqCst));
+        assert!(pair.a.begin_control(136, 32768));
+        assert!(pair.a.send(Message::MoveAbsolute { x: 32768, y: 32768 }));
+        wait_until(|| !pair.b_input.events.lock().unwrap().is_empty());
+        pair.b_input.fail_clipboard.store(false, Ordering::SeqCst);
+        assert!(pair.a.send(Message::Clipboard("retry".into())));
+        wait_until(|| !pair.b_input.clipboard.lock().unwrap().is_empty());
+        assert_eq!(
+            pair.b_input.clipboard.lock().unwrap().as_slice(),
+            &["retry"]
+        );
+    }
+
+    #[test]
+    fn corner_guard_blocks_screen_and_relative_returns_until_leaving_corner() {
+        for relative in [false, true] {
+            let pair = Loopback::new(false);
+            pair.a.relative_mouse.store(relative, Ordering::SeqCst);
+            pair.b.block_corners.store(true, Ordering::SeqCst);
+            assert!(pair.a.begin_control(136, 0));
+            wait_until(|| pair.b.incoming.load(Ordering::SeqCst));
+            if relative {
+                *pair.b_input.return_y.lock().unwrap() = Some(0);
+                wait_until(|| pair.b_input.return_y.lock().unwrap().is_none());
+            } else {
+                assert!(pair.a.send(Message::MoveAbsolute { x: -100, y: 0 }));
+                wait_until(|| !pair.b_input.events.lock().unwrap().is_empty());
+            }
+            assert!(pair.b.incoming.load(Ordering::SeqCst));
+            assert!(pair.a.remote.load(Ordering::SeqCst));
+            if relative {
+                *pair.b_input.return_y.lock().unwrap() = Some(32768);
+            } else {
+                assert!(pair.a.send(Message::MoveAbsolute { x: -100, y: 32768 }));
+            }
+            wait_until(|| !pair.a.remote.load(Ordering::SeqCst));
+            assert!(!pair.b.incoming.load(Ordering::SeqCst));
+            wait_until(|| !pair.a_input.returns.lock().unwrap().is_empty());
+            assert_eq!(
+                pair.a_input.returns.lock().unwrap().as_slice(),
+                &[(true, 32768)]
+            );
         }
     }
 
@@ -839,7 +1334,7 @@ mod tests {
         assert!(pair.b_input.releases.load(Ordering::SeqCst) > 0);
 
         pair.b_input.fail_enter.store(false, Ordering::SeqCst);
-        pair.b.enabled.store(true, Ordering::SeqCst);
+        pair.b.resume().unwrap();
         wait_until(|| pair.a.can_switch());
         assert!(pair.a.begin_control(136, 16384));
         wait_until(|| pair.b.incoming.load(Ordering::SeqCst));
@@ -858,7 +1353,7 @@ mod tests {
         assert!(pair.a.snapshot().connected && pair.b.snapshot().connected);
 
         pair.b_input.fail_apply.store(false, Ordering::SeqCst);
-        pair.b.enabled.store(true, Ordering::SeqCst);
+        pair.b.resume().unwrap();
         wait_until(|| pair.a.can_switch());
         assert!(pair.a.begin_control(136, 16384));
         wait_until(|| pair.b.incoming.load(Ordering::SeqCst));

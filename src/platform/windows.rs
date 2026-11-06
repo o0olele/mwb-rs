@@ -135,7 +135,7 @@ fn cursor_position() -> Result<PixelPoint> {
 }
 
 pub fn control_remote(rt: &Runtime) -> Result<()> {
-    ensure!(rt.enabled.load(Ordering::SeqCst), "请先连接并开启共享");
+    ensure!(rt.sharing_enabled(), "请先连接并开启共享");
     let point = cursor_position()?;
     if rt.begin_control(
         primary().entry_ratio(rt.right.load(Ordering::SeqCst)),
@@ -201,7 +201,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         let Some(rt) = RUNTIME.get() else {
             return CallNextHookEx(None, code, wp, lp);
         };
-        if !rt.enabled.load(Ordering::Relaxed) {
+        if !rt.sharing_enabled() {
             return CallNextHookEx(None, code, wp, lp);
         }
         if rt.incoming.load(Ordering::Relaxed) {
@@ -216,12 +216,17 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         {
             let bounds = desktop();
             let right = rt.right.load(Ordering::Relaxed);
-            if ((right && event.pt.x >= bounds.right()) || (!right && event.pt.x <= bounds.left))
-                && rt.begin_control(
-                    primary().entry_ratio(right),
-                    bounds.height_ratio(event.pt.y),
-                )
-            {
+            if bounds.crosses_edge(
+                PixelPoint {
+                    x: event.pt.x,
+                    y: event.pt.y,
+                },
+                right,
+                rt.block_corners.load(Ordering::Relaxed),
+            ) && rt.begin_control(
+                primary().entry_ratio(right),
+                bounds.height_ratio(event.pt.y),
+            ) {
                 if park_cursor().is_err() {
                     rt.reclaim();
                     return CallNextHookEx(None, code, wp, lp);
@@ -315,7 +320,7 @@ unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
             rt.reclaim();
             return LRESULT(1);
         }
-        if !rt.enabled.load(Ordering::Relaxed) {
+        if !rt.sharing_enabled() {
             return CallNextHookEx(None, code, wp, lp);
         }
         if rt.incoming.load(Ordering::Relaxed) {
@@ -442,16 +447,26 @@ impl Injector {
             .is_some_and(|entered| entered.elapsed() >= SWITCH_DELAY)
     }
 
-    pub fn poll_return(&self) -> Result<Option<u16>> {
+    pub fn poll_return(&self, block_corners: bool) -> Result<Option<u16>> {
         if self.motion.is_relative() && self.can_return() {
-            Ok(self.motion.observe(desktop(), cursor_position()?))
+            let bounds = desktop();
+            let point = cursor_position()?;
+            Ok(self
+                .motion
+                .observe(bounds, point)
+                .filter(|_| bounds.outside_corner(point.y, block_corners)))
         } else {
             Ok(None)
         }
     }
 
     /// Returns the crossing height when control should return to the source PC.
-    pub fn apply(&mut self, message: Message, keyboard: bool) -> Result<Option<u16>> {
+    pub fn apply(
+        &mut self,
+        message: Message,
+        keyboard: bool,
+        block_corners: bool,
+    ) -> Result<Option<u16>> {
         match message {
             Message::Move { dx, dy } => {
                 self.motion.relative(dx, dy)?;
@@ -459,7 +474,9 @@ impl Injector {
             }
             Message::MoveAbsolute { x, y } => {
                 let bounds = desktop();
-                match self.motion.absolute(bounds, x, y, self.can_return())? {
+                let can_return = self.can_return()
+                    && bounds.outside_corner(bounds.point_at(x, y).y, block_corners);
+                match self.motion.absolute(bounds, x, y, can_return)? {
                     MotionStep::ReturnLocal { y } => return Ok(Some(y)),
                     MotionStep::MoveTo(point) => move_absolute(bounds, point)?,
                 }
