@@ -1,10 +1,14 @@
 use crate::{
     config::Config,
+    exchange::{
+        self, Exchange,
+        clipboard::{Backend, SystemClipboard},
+    },
     layout::{DeviceInfo, Layout, Placement, Point},
     motion::{RemoteMotion, SWITCH_DELAY},
     network::{self, Event, Link},
     platform::{self, InputInjectionError},
-    protocol::{Control, InputEvent, MAX_TEXT_BYTES, Message, MouseMode},
+    protocol::{Control, InputEvent, Message, MouseMode},
 };
 use anyhow::{Result, bail, ensure};
 use std::{
@@ -41,9 +45,9 @@ enum Command {
     Motion(u64, i32, i32),
     Input(u64, InputEvent),
     Arrange(u64, Vec<Placement>),
-    Clipboard(String, String),
 }
 pub struct Runtime {
+    pub exchange: Exchange,
     pub status: Mutex<Status>,
     pub local: DeviceInfo,
     pub running: AtomicBool,
@@ -84,6 +88,7 @@ impl Runtime {
                 .expect("valid local screen");
         }
         Arc::new(Self {
+            exchange: Exchange::new(config),
             status: Mutex::new(Status {
                 detail: "尚未启动工作组".into(),
                 layout,
@@ -230,22 +235,7 @@ impl Runtime {
     }
     pub fn clipboard(&self, target: String, text: String) -> Result<()> {
         ensure!(self.sharing_enabled(), "请先连接并开启共享");
-        ensure!(text.len() <= MAX_TEXT_BYTES, "剪贴板文本超过 32 KB");
-        ensure!(
-            serde_json::to_vec(&Message::SendClipboard {
-                target: target.clone(),
-                text: text.clone()
-            })?
-            .len()
-                + 16
-                <= crate::transport::MAX_FRAME,
-            "文本转义后超过单帧限制"
-        );
-        ensure!(
-            self.enqueue(Command::Clipboard(target, text)),
-            "发送队列不可用"
-        );
-        Ok(())
+        self.exchange.text(target, text)
     }
     pub fn arrange(&self, revision: u64, positions: Vec<Placement>) -> Result<()> {
         let state = self.snapshot();
@@ -276,12 +266,12 @@ pub(crate) trait SessionInput: Send {
     fn position(&mut self) -> Result<Point>;
     fn release_all(&mut self);
     fn park(&mut self) -> Result<()>;
-    fn clipboard(&mut self, text: String) -> Result<()> {
-        arboard::Clipboard::new()?.set_text(text)?;
-        Ok(())
-    }
+    fn clipboard_backend(&self) -> Box<dyn Backend>;
 }
 impl SessionInput for platform::Injector {
+    fn clipboard_backend(&self) -> Box<dyn Backend> {
+        Box::new(SystemClipboard)
+    }
     fn enable(&mut self, rt: Arc<Runtime>) -> Result<()> {
         platform::install_hooks(rt)
     }
@@ -332,6 +322,17 @@ fn start_with_input(
         Ok(n) => n,
         Err(e) => {
             rt.running.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    let exchange = match exchange::launch(rt.clone(), key, host, input.clipboard_backend()) {
+        Ok(exchange) => exchange,
+        Err(e) => {
+            rt.stop.store(true, Ordering::SeqCst);
+            drop(erx);
+            let _ = network.join();
+            rt.running.store(false, Ordering::SeqCst);
+            rt.status.lock().unwrap().listening = false;
             return Err(e);
         }
     };
@@ -414,6 +415,7 @@ fn start_with_input(
         *rt.commands.lock().unwrap() = None;
         drop(erx);
         let _ = network.join();
+        let _ = exchange.join();
         rt.enabled.store(false, Ordering::SeqCst);
         rt.remote.store(false, Ordering::SeqCst);
         rt.incoming.store(false, Ordering::SeqCst);
@@ -435,6 +437,7 @@ fn start_with_input(
 struct Peer {
     device: DeviceInfo,
     link: Link,
+    address: std::net::SocketAddr,
 }
 struct Group {
     rt: Arc<Runtime>,
@@ -488,6 +491,7 @@ impl Group {
                 connection,
                 device,
                 link,
+                address,
             } => {
                 let result = (|| -> Result<()> {
                     ensure!(
@@ -507,6 +511,7 @@ impl Group {
                         Peer {
                             device: device.clone(),
                             link: link.clone(),
+                            address,
                         },
                     );
                     self.rt.ever_connected.store(true, Ordering::SeqCst);
@@ -520,6 +525,11 @@ impl Group {
                     if self.host {
                         self.broadcast(self.topology());
                         link.send(Message::Control(self.control.clone()));
+                        let (port, ticket) = self
+                            .rt
+                            .exchange
+                            .register(device.id.clone(), link.closed.clone());
+                        link.send(Message::DataChannel { port, ticket });
                     }
                     if enabled_without_error {
                         self.rt.log(format!(
@@ -545,7 +555,17 @@ impl Group {
             } => {
                 if let Some(peer) = self.peers.get(&connection) {
                     let source = peer.device.id.clone();
-                    let result = if self.host {
+                    let result = if let Message::DataChannel { port, ticket } = &message {
+                        if self.host {
+                            Err(anyhow::anyhow!("客户端不能分配文件通道"))
+                        } else {
+                            self.rt.exchange.join(
+                                std::net::SocketAddr::new(peer.address.ip(), *port),
+                                ticket.clone(),
+                                peer.link.closed.clone(),
+                            )
+                        }
+                    } else if self.host {
                         self.hub_message(&source, message, input)
                     } else {
                         self.client_message(message, input)
@@ -560,6 +580,7 @@ impl Group {
             }
             Event::Disconnected { connection, detail } => {
                 if let Some(peer) = self.peers.remove(&connection) {
+                    self.rt.exchange.unregister(&peer.device.id);
                     if self.host {
                         if let Some(d) = self
                             .layout
@@ -641,9 +662,6 @@ impl Group {
                 },
                 input,
             ),
-            Command::Clipboard(target, text) => {
-                self.submit(Message::SendClipboard { target, text }, input)
-            }
         }
     }
     fn take(&mut self, target: String, point: Point, input: &mut impl SessionInput) -> Result<()> {
@@ -789,17 +807,6 @@ impl Group {
                     }
                 }
             }
-            Message::SendClipboard { target, text } => {
-                ensure!(text.len() <= MAX_TEXT_BYTES, "剪贴板文本超过 32 KB");
-                self.deliver(
-                    &target,
-                    Message::DeliverClipboard {
-                        source: source.into(),
-                        text,
-                    },
-                    input,
-                )?;
-            }
             _ => bail!("客户端发送了不允许的消息"),
         }
         Ok(())
@@ -917,15 +924,6 @@ impl Group {
                 {
                     m.point = point;
                     self.try_cross(input)?;
-                }
-            }
-            Message::DeliverClipboard { source: _, text } => {
-                ensure!(text.len() <= MAX_TEXT_BYTES, "剪贴板文本过长");
-                if self.rt.sharing_enabled() {
-                    match input.clipboard(text) {
-                        Ok(()) => self.rt.log("已收到剪贴板文本"),
-                        Err(e) => self.rt.log(format!("剪贴板写入失败，连接保持：{e:#}")),
-                    }
                 }
             }
             Message::Notice(text) => {

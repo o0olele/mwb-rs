@@ -43,6 +43,7 @@ pub(crate) enum Event {
         connection: u64,
         device: DeviceInfo,
         link: Link,
+        address: SocketAddr,
     },
     Message {
         connection: u64,
@@ -254,7 +255,7 @@ fn connection(
                             };
                             ensure!(
                                 version == VERSION,
-                                "两端版本不同，多设备工作组需要两端均更新到 v0.3.0"
+                                "两端版本不同，需要所有设备均更新到 v0.4.0"
                             );
                             device.validate()?;
                             ensure!(
@@ -265,6 +266,7 @@ fn connection(
                                 connection: id,
                                 device,
                                 link: link.clone(),
+                                address: socket.peer_addr()?,
                             })?;
                             hello = true;
                         } else if !matches!(message, Message::Ping) {
@@ -292,6 +294,7 @@ fn connection(
         );
         Ok(())
     })();
+    link.closed.store(true, Ordering::SeqCst);
     let _ = socket.shutdown(Shutdown::Both);
     result
 }

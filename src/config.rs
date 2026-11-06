@@ -16,6 +16,9 @@ pub struct Config {
     pub relative_mouse: bool,
     pub auto_reconnect: bool,
     pub block_corners: bool,
+    pub auto_clipboard: bool,
+    pub transfer_rate_mib: u32,
+    pub receive_directory: PathBuf,
 }
 
 impl Default for Config {
@@ -31,6 +34,13 @@ impl Default for Config {
             relative_mouse: false,
             auto_reconnect: true,
             block_corners: false,
+            auto_clipboard: true,
+            transfer_rate_mib: 8,
+            receive_directory: std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Downloads")
+                .join("MWB Received"),
         }
     }
 }

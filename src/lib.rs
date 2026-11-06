@@ -1,5 +1,6 @@
 pub mod config;
 pub mod engine;
+pub mod exchange;
 pub mod layout;
 mod motion;
 mod network;

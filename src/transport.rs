@@ -190,10 +190,7 @@ mod tests {
     #[test]
     fn encrypted_transport_handles_fragmentation_and_both_directions() {
         let (mut client, mut server) = pair();
-        let expected = Message::DeliverClipboard {
-            source: "test".into(),
-            text: "中文剪贴板 🖱".into(),
-        };
+        let expected = Message::Notice("中文消息 🖱".into());
         let frame = encode(&mut client, &expected).unwrap();
         assert!(!String::from_utf8_lossy(&frame).contains("剪贴板"));
         let mut incoming = Vec::new();

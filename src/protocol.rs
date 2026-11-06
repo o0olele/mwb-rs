@@ -1,7 +1,6 @@
 use crate::layout::{DeviceInfo, Layout, Placement, Point};
 use serde::{Deserialize, Serialize};
-pub const VERSION: u32 = 3;
-pub const MAX_TEXT_BYTES: usize = 32 * 1024;
+pub const VERSION: u32 = 4;
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MouseMode {
     #[default]
@@ -74,13 +73,9 @@ pub enum Message {
         epoch: u64,
         point: Point,
     },
-    SendClipboard {
-        target: String,
-        text: String,
-    },
-    DeliverClipboard {
-        source: String,
-        text: String,
+    DataChannel {
+        port: u16,
+        ticket: String,
     },
     Notice(String),
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::exchange::clipboard::Content;
 use crate::layout::{Rect, test_device};
 use std::{
     collections::HashSet,
@@ -13,6 +14,10 @@ struct Probe {
     point: Mutex<Point>,
     held: Mutex<HashSet<u16>>,
     clipboard: Mutex<Vec<String>>,
+    clipboard_content: Mutex<Option<Content>>,
+    clipboard_sequence: AtomicU64,
+    clipboard_writes: AtomicU64,
+    clipboard_files: Mutex<Vec<std::path::PathBuf>>,
     fail_enable: AtomicBool,
     fail_enter: AtomicBool,
     fail_apply: AtomicBool,
@@ -91,15 +96,36 @@ impl SessionInput for FakeInput {
         *self.probe.point.lock().unwrap() = self.bounds.center();
         Ok(())
     }
-    fn clipboard(&mut self, text: String) -> Result<()> {
+    fn clipboard_backend(&self) -> Box<dyn Backend> {
+        Box::new(FakeClipboard(self.probe.clone()))
+    }
+}
+struct FakeClipboard(Arc<Probe>);
+impl Backend for FakeClipboard {
+    fn files(&mut self) -> Result<Vec<std::path::PathBuf>> {
+        Ok(self.0.clipboard_files.lock().unwrap().clone())
+    }
+    fn sequence(&mut self) -> u64 {
+        self.0.clipboard_sequence.load(Ordering::SeqCst)
+    }
+    fn read(&mut self) -> Result<Option<Content>> {
+        Ok(self.0.clipboard_content.lock().unwrap().clone())
+    }
+    fn write(&mut self, content: &Content) -> Result<()> {
         ensure!(
-            !self.probe.fail_clipboard.load(Ordering::SeqCst),
+            !self.0.fail_clipboard.load(Ordering::SeqCst),
             "模拟剪贴板占用"
         );
-        self.probe.clipboard.lock().unwrap().push(text);
+        if let Ok(text) = String::from_utf8(content.data.as_ref().clone()) {
+            self.0.clipboard.lock().unwrap().push(text);
+        }
+        *self.0.clipboard_content.lock().unwrap() = Some(content.clone());
+        self.0.clipboard_sequence.fetch_add(1, Ordering::SeqCst);
+        self.0.clipboard_writes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
+#[track_caller]
 fn wait(mut predicate: impl FnMut() -> bool) {
     let start = Instant::now();
     while !predicate() {
@@ -166,8 +192,10 @@ impl Cluster {
                         .count()
                         == count
                         && n.sharing_enabled()
+                        && n.exchange.ready()
                 })
             });
+            wait(|| cluster.nodes[0].exchange.connection_count() == count - 1);
         }
         cluster
     }
@@ -175,11 +203,15 @@ impl Cluster {
         wait(|| self.nodes[from].can_switch());
         self.nodes[from].control(&self.nodes[to].local.id).unwrap();
         wait(|| {
-            self.nodes.iter().all(|n| {
-                n.snapshot().control.as_ref().is_some_and(|c| {
-                    c.controller == self.nodes[from].local.id && c.target == self.nodes[to].local.id
+            self.nodes
+                .iter()
+                .filter(|n| n.snapshot().connected)
+                .all(|n| {
+                    n.snapshot().control.as_ref().is_some_and(|c| {
+                        c.controller == self.nodes[from].local.id
+                            && c.target == self.nodes[to].local.id
+                    })
                 })
-            })
         });
         self.nodes[from].snapshot().control.unwrap().epoch
     }
@@ -458,7 +490,7 @@ fn targeted_clipboard_failure_keeps_keyboard_links_alive() {
     c.nodes[1]
         .clipboard(c.nodes[2].local.id.clone(), "中文".into())
         .unwrap();
-    wait(|| c.nodes[2].snapshot().detail.contains("剪贴板写入失败"));
+    wait(|| c.nodes[2].snapshot().detail.contains("模拟剪贴板占用"));
     c.control(1, 2);
     c.key(1, 65);
     wait(|| c.probes[2].held.lock().unwrap().contains(&65));
@@ -603,4 +635,355 @@ fn stopping_client_cancels_pending_handshake() {
     wait(|| !rt.running.load(Ordering::SeqCst));
     assert!(now.elapsed() < Duration::from_secs(2));
     assert_eq!(probe.enables.load(Ordering::SeqCst), 0);
+}
+
+fn local_copy(probe: &Probe, content: Content) {
+    *probe.clipboard_content.lock().unwrap() = Some(content);
+    probe.clipboard_sequence.fetch_add(1, Ordering::SeqCst);
+}
+fn clipboard_bytes(probe: &Probe) -> Vec<u8> {
+    probe
+        .clipboard_content
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.data.as_ref().clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn automatic_text_and_images_reach_all_devices_without_echo() {
+    let c = Cluster::new(3);
+    let text = "中文自动剪贴板\n".repeat(10_000);
+    local_copy(&c.probes[1], Content::text(text.clone()));
+    wait(|| {
+        clipboard_bytes(&c.probes[0]) == text.as_bytes()
+            && clipboard_bytes(&c.probes[2]) == text.as_bytes()
+    });
+    thread::sleep(Duration::from_millis(450));
+    assert_eq!(c.probes[1].clipboard_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(c.probes[0].clipboard_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(c.probes[2].clipboard_writes.load(Ordering::SeqCst), 1);
+    let rgba: Vec<_> = (0..64 * 48 * 4).map(|i| (i % 251) as u8).collect();
+    local_copy(&c.probes[2], Content::image(64, 48, rgba.clone()));
+    wait(|| clipboard_bytes(&c.probes[0]) == rgba && clipboard_bytes(&c.probes[1]) == rgba);
+    thread::sleep(Duration::from_millis(350));
+    assert_eq!(c.probes[2].clipboard_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(c.probes[0].clipboard_writes.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn clipboard_switch_and_pause_stop_automatic_sync_but_manual_send_is_available() {
+    let c = Cluster::new(3);
+    c.nodes[2]
+        .exchange
+        .auto_clipboard
+        .store(false, Ordering::SeqCst);
+    local_copy(&c.probes[1], Content::text("automatic".into()));
+    wait(|| clipboard_bytes(&c.probes[0]) == b"automatic");
+    thread::sleep(Duration::from_millis(250));
+    assert!(clipboard_bytes(&c.probes[2]).is_empty());
+    c.nodes[1]
+        .clipboard(c.nodes[2].local.id.clone(), "manual".into())
+        .unwrap();
+    wait(|| clipboard_bytes(&c.probes[2]) == b"manual");
+    c.nodes[1].reclaim();
+    thread::sleep(Duration::from_millis(200));
+    local_copy(&c.probes[1], Content::text("paused".into()));
+    thread::sleep(Duration::from_millis(350));
+    assert_eq!(clipboard_bytes(&c.probes[0]), b"automatic");
+    c.nodes[1].resume().unwrap();
+    local_copy(&c.probes[1], Content::text("resumed".into()));
+    wait(|| clipboard_bytes(&c.probes[0]) == b"resumed");
+}
+
+#[test]
+fn a_new_local_copy_wins_over_an_older_clipboard_still_in_flight() {
+    let c = Cluster::new(3);
+    c.nodes[1].exchange.set_rate_mib(1);
+    local_copy(&c.probes[1], Content::text("old".repeat(500_000)));
+    wait(|| c.nodes[2].exchange.clipboard_clock.load(Ordering::SeqCst) > 0);
+    local_copy(&c.probes[2], Content::text("new local copy".into()));
+    wait(|| {
+        clipboard_bytes(&c.probes[0]) == b"new local copy"
+            && clipboard_bytes(&c.probes[1]) == b"new local copy"
+    });
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(clipboard_bytes(&c.probes[2]), b"new local copy");
+}
+
+#[test]
+fn rejoining_device_receives_the_clipboard_clock_before_publishing() {
+    let c = Cluster::new(3);
+    c.nodes[0]
+        .exchange
+        .clipboard_clock
+        .store(500, Ordering::SeqCst);
+    local_copy(&c.probes[0], Content::text("earlier".into()));
+    wait(|| clipboard_bytes(&c.probes[2]) == b"earlier");
+    c.nodes[2].stop();
+    wait(|| !c.nodes[2].running.load(Ordering::SeqCst));
+    c.nodes[2]
+        .exchange
+        .clipboard_clock
+        .store(0, Ordering::SeqCst);
+    *c.nodes[2].exchange.clipboard_version.lock().unwrap() = Default::default();
+    start_with_input(
+        c.nodes[2].clone(),
+        c.configs[2].clone(),
+        [23; 32],
+        Some(c.address.clone()),
+        FakeInput {
+            probe: c.probes[2].clone(),
+            bounds: c.nodes[2].local.bounds,
+            mode: None,
+        },
+    )
+    .unwrap();
+    wait(|| c.nodes[2].exchange.ready() && c.nodes[2].sharing_enabled());
+    assert!(c.nodes[2].exchange.clipboard_clock.load(Ordering::SeqCst) >= 501);
+    local_copy(&c.probes[2], Content::text("after restart".into()));
+    wait(|| {
+        clipboard_bytes(&c.probes[0]) == b"after restart"
+            && clipboard_bytes(&c.probes[1]) == b"after restart"
+    });
+}
+
+#[test]
+fn files_from_clipboard_require_acceptance_and_preserve_duplicate_names() {
+    use crate::exchange::Phase;
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let path = source.path().join("文档.bin");
+    let content: Vec<_> = (0..150_000).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &content).unwrap();
+    std::fs::write(destination.path().join("文档.bin"), b"existing").unwrap();
+    *c.probes[1].clipboard_files.lock().unwrap() = vec![path];
+    c.nodes[1]
+        .exchange
+        .send_clipboard_files(c.nodes[2].local.id.clone())
+        .unwrap();
+    wait(|| !c.nodes[2].exchange.snapshot().is_empty());
+    let offer = c.nodes[2].exchange.snapshot()[0].clone();
+    assert_eq!(offer.phase, Phase::Offered);
+    assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 1);
+    c.nodes[2]
+        .exchange
+        .accept(offer.id.clone(), destination.path().into())
+        .unwrap();
+    wait(|| {
+        c.nodes[1]
+            .exchange
+            .snapshot()
+            .iter()
+            .any(|t| t.id == offer.id && t.phase == Phase::Complete)
+    });
+    let received = c.nodes[2].exchange.snapshot()[0].path.clone().unwrap();
+    assert_eq!(std::fs::read(received).unwrap(), content);
+    assert_eq!(
+        std::fs::read(destination.path().join("文档.bin")).unwrap(),
+        b"existing"
+    );
+    assert!(
+        c.nodes[0].exchange.snapshot().is_empty(),
+        "hub only relays the file"
+    );
+}
+
+#[test]
+fn throttled_file_stream_keeps_mouse_and_keyboard_dispatch_responsive() {
+    use crate::exchange::Phase;
+    let c = Cluster::new(3);
+    // The receiver's setting also limits incoming traffic, even if senders are faster.
+    c.nodes[2].exchange.set_rate_mib(1);
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let path = source.path().join("stream.bin");
+    std::fs::write(&path, vec![31; 2 * 1024 * 1024]).unwrap();
+    c.nodes[1]
+        .exchange
+        .send_files(c.nodes[2].local.id.clone(), vec![path])
+        .unwrap();
+    wait(|| !c.nodes[2].exchange.snapshot().is_empty());
+    let offer = c.nodes[2].exchange.snapshot()[0].clone();
+    let start = Instant::now();
+    c.nodes[2]
+        .exchange
+        .accept(offer.id.clone(), destination.path().into())
+        .unwrap();
+    wait(|| c.nodes[2].exchange.snapshot()[0].transferred > 0);
+    c.control(1, 2);
+    let mut worst = Duration::ZERO;
+    for i in 0..30 {
+        let mark = Instant::now();
+        let old_events = c.probes[2].events.lock().unwrap().len();
+        assert!(c.nodes[1].capture(1, 1));
+        assert!(c.nodes[1].send_input(InputEvent::Key {
+            vk: 65,
+            scan: 30,
+            extended: false,
+            down: i % 2 == 0
+        }));
+        wait(|| c.probes[2].events.lock().unwrap().len() >= old_events + 2);
+        worst = worst.max(mark.elapsed());
+    }
+    assert!(worst < Duration::from_secs(1), "input stalled: {worst:?}");
+    wait(|| {
+        let transfer = c.nodes[1].exchange.snapshot()[0].clone();
+        assert!(
+            !transfer.phase.terminal() || transfer.phase == Phase::Complete,
+            "{transfer:?}"
+        );
+        transfer.phase == Phase::Complete
+    });
+    assert!(
+        start.elapsed() >= Duration::from_millis(1700),
+        "configured aggregate rate was not enforced"
+    );
+    assert!(
+        c.nodes
+            .iter()
+            .all(|n| n.sharing_enabled() && n.snapshot().connected)
+    );
+    eprintln!(
+        "2 MiB limited relay finished in {:?}; worst input dispatch {:?}",
+        start.elapsed(),
+        worst
+    );
+}
+
+#[test]
+fn rejected_and_interrupted_files_clean_up_without_breaking_other_peers() {
+    use crate::exchange::Phase;
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let path = source.path().join("cancel.bin");
+    std::fs::write(&path, vec![1; 4 * 1024 * 1024]).unwrap();
+    c.nodes[1].exchange.set_rate_mib(1);
+    c.nodes[1]
+        .exchange
+        .send_files(c.nodes[2].local.id.clone(), vec![path.clone()])
+        .unwrap();
+    wait(|| !c.nodes[2].exchange.snapshot().is_empty());
+    let id = c.nodes[2].exchange.snapshot()[0].id.clone();
+    c.nodes[2].exchange.cancel(id.clone()).unwrap();
+    wait(|| c.nodes[1].exchange.snapshot()[0].phase == Phase::Cancelled);
+    assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+    c.nodes[1]
+        .exchange
+        .send_files(c.nodes[2].local.id.clone(), vec![path])
+        .unwrap();
+    wait(|| c.nodes[2].exchange.snapshot()[0].phase == Phase::Offered);
+    let id = c.nodes[2].exchange.snapshot()[0].id.clone();
+    c.nodes[2]
+        .exchange
+        .accept(id, destination.path().into())
+        .unwrap();
+    wait(|| c.nodes[2].exchange.snapshot()[0].transferred > 0);
+    c.nodes[2].stop();
+    wait(|| !c.nodes[2].running.load(Ordering::SeqCst));
+    assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+    c.control(1, 0);
+    c.key(1, 66);
+    wait(|| c.probes[0].held.lock().unwrap().contains(&66));
+}
+
+#[test]
+fn empty_and_multiple_files_complete_independently() {
+    use crate::exchange::Phase;
+    let c = Cluster::new(2);
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = ["empty.txt", "second.txt"]
+        .into_iter()
+        .map(|name| source.path().join(name))
+        .collect();
+    std::fs::write(&paths[0], []).unwrap();
+    std::fs::write(&paths[1], b"second").unwrap();
+    c.nodes[0]
+        .exchange
+        .send_files(c.nodes[1].local.id.clone(), paths)
+        .unwrap();
+    wait(|| c.nodes[1].exchange.snapshot().len() == 2);
+    for offer in c.nodes[1].exchange.snapshot() {
+        c.nodes[1]
+            .exchange
+            .accept(offer.id, destination.path().into())
+            .unwrap();
+    }
+    wait(|| {
+        c.nodes[0]
+            .exchange
+            .snapshot()
+            .iter()
+            .all(|t| t.phase == Phase::Complete)
+    });
+    assert_eq!(
+        std::fs::read(destination.path().join("empty.txt")).unwrap(),
+        b""
+    );
+    assert_eq!(
+        std::fs::read(destination.path().join("second.txt")).unwrap(),
+        b"second"
+    );
+}
+
+#[test]
+#[ignore = "writes and relays 128 MiB; run explicitly for release validation"]
+fn file_larger_than_original_100mb_limit_streams_end_to_end() {
+    use crate::exchange::Phase;
+    use sha2::{Digest, Sha256};
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let path = source.path().join("128MiB.bin");
+    let block: Vec<_> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut file = std::fs::File::create(&path).unwrap();
+    let mut expected = Sha256::new();
+    for _ in 0..128 {
+        file.write_all(&block).unwrap();
+        expected.update(&block);
+    }
+    drop(file);
+    c.nodes[1]
+        .exchange
+        .send_files(c.nodes[2].local.id.clone(), vec![path])
+        .unwrap();
+    wait(|| !c.nodes[2].exchange.snapshot().is_empty());
+    let offer = c.nodes[2].exchange.snapshot()[0].clone();
+    assert_eq!(offer.size, 128 * 1024 * 1024);
+    c.nodes[2]
+        .exchange
+        .accept(offer.id.clone(), destination.path().into())
+        .unwrap();
+    let start = Instant::now();
+    loop {
+        let state = c.nodes[1].exchange.snapshot()[0].clone();
+        if state.phase == Phase::Complete {
+            break;
+        }
+        assert!(!state.phase.terminal(), "transfer failed: {state:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(180),
+            "large file timed out"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut file = std::fs::File::open(destination.path().join("128MiB.bin")).unwrap();
+    let mut actual = Sha256::new();
+    let mut buffer = [0u8; 32768];
+    loop {
+        let n = file.read(&mut buffer).unwrap();
+        if n == 0 {
+            break;
+        }
+        actual.update(&buffer[..n]);
+    }
+    assert_eq!(actual.finalize(), expected.finalize());
+    eprintln!(
+        "128 MiB SHA-256-verified client-to-client relay: {:?}",
+        start.elapsed()
+    );
 }

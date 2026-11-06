@@ -12,6 +12,7 @@ use mwb::{
         validate_pairing_key,
     },
     engine::{self, Runtime},
+    exchange::{Phase, format_size},
     layout::{Layout, Point as LayoutPoint},
     platform,
 };
@@ -206,15 +207,264 @@ impl Workspace {
     }
 
     fn copy_clipboard(&mut self, cx: &mut Context<Self>) {
-        let result = arboard::Clipboard::new()
-            .and_then(|mut c| c.get_text())
-            .map_err(anyhow::Error::from)
-            .and_then(|text| self.runtime.clipboard(self.selected.clone(), text));
+        let result = self.runtime.exchange.send_clipboard(self.selected.clone());
         self.notice = match result {
-            Ok(()) => "剪贴板文本已加入发送队列".into(),
+            Ok(()) => "剪贴板文本或图片已加入发送队列".into(),
             Err(e) => format!("{e:#}"),
         };
         cx.notify();
+    }
+
+    fn choose_files(&mut self, directory: bool, cx: &mut Context<Self>) {
+        let target = self.selected.clone();
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: !directory,
+            directories: directory,
+            multiple: !directory,
+            prompt: Some(
+                if directory {
+                    "选择接收文件夹"
+                } else {
+                    "选择要发送的文件"
+                }
+                .into(),
+            ),
+        });
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<_> = async { prompt.await? }.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(paths)) if directory => {
+                        if let Some(path) = paths.into_iter().next() {
+                            this.config.receive_directory = path;
+                            this.persist();
+                            this.notice = "接收文件夹已更新".into();
+                        }
+                    }
+                    Ok(Some(paths)) => {
+                        this.notice = match this.runtime.exchange.send_files(target, paths) {
+                            Ok(()) => "已发送文件邀请，等待对方接收".into(),
+                            Err(e) => format!("{e:#}"),
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(e) => this.notice = format!("打开文件选择器失败：{e:#}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn transfers(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.runtime.snapshot();
+        let ready = self.runtime.exchange.ready();
+        let target_online = state
+            .layout
+            .get(&self.selected)
+            .is_some_and(|d| d.online && d.info.id != self.runtime.local.id);
+        let transfers = self.runtime.exchange.snapshot();
+        let ordered = transfers
+            .iter()
+            .filter(|t| !t.phase.terminal())
+            .chain(transfers.iter().filter(|t| t.phase.terminal()).take(4));
+        card()
+            .gap_3()
+            .child(
+                div()
+                    .h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("剪贴板与文件"),
+                            )
+                            .child(subtle(if self.config.auto_clipboard {
+                                "自动同步工作组的文本与图片 · 文件发送给选中设备"
+                            } else {
+                                "自动剪贴板已关闭 · 仍可手动发送文本、图片和文件"
+                            })),
+                    )
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(if ready {
+                        "数据通道已连接"
+                    } else {
+                        "等待数据通道"
+                    })),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(
+                        Button::new("send-files")
+                            .primary()
+                            .label("选择文件发送")
+                            .disabled(!ready || !target_online)
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_files(false, cx))),
+                    )
+                    .child(
+                        Button::new("send-clipboard-files")
+                            .label("发送剪贴板中的文件")
+                            .disabled(!ready || !target_online)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.notice = match this
+                                    .runtime
+                                    .exchange
+                                    .send_clipboard_files(this.selected.clone())
+                                {
+                                    Ok(()) => "正在读取已复制的文件，等待对方接收".into(),
+                                    Err(e) => format!("{e:#}"),
+                                };
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("choose-receive-folder")
+                            .ghost()
+                            .label("接收文件夹")
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_files(true, cx))),
+                    ),
+            )
+            .child(subtle(format!(
+                "保存到 {} · {} · 无文件大小上限",
+                self.config.receive_directory.display(),
+                if self.config.transfer_rate_mib == 0 {
+                    "不限速".into()
+                } else {
+                    format!("限速 {} MiB/s", self.config.transfer_rate_mib)
+                }
+            )))
+            .when(transfers.is_empty(), |el| {
+                el.child(subtle(
+                    "选择设备后发送文件；收到文件邀请时点击接收。同名文件自动改名。",
+                ))
+            })
+            .child(
+                div()
+                    .id("transfer-list")
+                    .v_flex()
+                    .gap_2()
+                    .max_h(px(350.))
+                    .overflow_y_scroll()
+                    .children(ordered.map(|t| {
+                        let accept_id = t.id.clone();
+                        let cancel_id = t.id.clone();
+                        let peer = state
+                            .layout
+                            .get(&t.peer)
+                            .map(|d| d.info.name.as_str())
+                            .unwrap_or("其他设备");
+                        let fraction = if t.size == 0 {
+                            if t.phase == Phase::Complete { 1.0 } else { 0.0 }
+                        } else {
+                            (t.transferred as f64 / t.size as f64).min(1.0)
+                        };
+                        div()
+                            .v_flex()
+                            .gap_2()
+                            .p_3()
+                            .bg(rgb(0xF4F6F3))
+                            .rounded_md()
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .v_flex()
+                                            .gap_1()
+                                            .child(div().text_sm().child(format!(
+                                                "{} · {} {}",
+                                                t.name,
+                                                if t.incoming { "来自" } else { "发往" },
+                                                peer
+                                            )))
+                                            .child(subtle(format!(
+                                                "{} · {} / {}",
+                                                t.phase.label(),
+                                                format_size(t.transferred),
+                                                format_size(t.size)
+                                            ))),
+                                    )
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .gap_2()
+                                            .when(t.phase == Phase::Offered, |el| {
+                                                el.child(
+                                                    Button::new(format!("accept-{accept_id}"))
+                                                        .small()
+                                                        .primary()
+                                                        .label("接收")
+                                                        .disabled(!ready)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                if let Err(e) =
+                                                                    this.runtime.exchange.accept(
+                                                                        accept_id.clone(),
+                                                                        this.config
+                                                                            .receive_directory
+                                                                            .clone(),
+                                                                    )
+                                                                {
+                                                                    this.notice = format!("{e:#}");
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                )
+                                            })
+                                            .when(!t.phase.terminal(), |el| {
+                                                el.child(
+                                                    Button::new(format!("cancel-{cancel_id}"))
+                                                        .small()
+                                                        .ghost()
+                                                        .label(if t.phase == Phase::Offered {
+                                                            "拒绝"
+                                                        } else {
+                                                            "取消"
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                if let Err(e) = this
+                                                                    .runtime
+                                                                    .exchange
+                                                                    .cancel(cancel_id.clone())
+                                                                {
+                                                                    this.notice = format!("{e:#}");
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                )
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div().h(px(3.)).w_full().bg(rgb(BORDER)).rounded_sm().child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(fraction as f32))
+                                        .bg(rgb(GREEN))
+                                        .rounded_sm(),
+                                ),
+                            )
+                            .when(!t.detail.is_empty(), |el| {
+                                el.child(subtle(t.detail.clone()))
+                            })
+                            .when_some(t.path.clone(), |el, path| {
+                                el.child(subtle(path.display().to_string()))
+                            })
+                    })),
+            )
     }
 
     fn refresh_layout(&mut self) {
@@ -935,8 +1185,13 @@ impl Workspace {
                                 Button::new("send-clipboard")
                                     .small()
                                     .ghost()
-                                    .label("发送文本到选中设备")
-                                    .disabled(!connected || !enabled || !selected_online)
+                                    .label("发送剪贴板")
+                                    .disabled(
+                                        !connected
+                                            || !enabled
+                                            || !selected_online
+                                            || !self.runtime.exchange.ready(),
+                                    )
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.copy_clipboard(cx)),
                                     ),
@@ -1062,9 +1317,47 @@ impl Workspace {
                     })),
             ))
             .child(option_row(
-                "剪贴板文本",
-                "在设备与连接页主动发送，单次最多 32 KB。",
-                div().text_xs().text_color(rgb(MUTED)).child("手动发送"),
+                "自动剪贴板",
+                "将新复制的文本与图片同步到工作组；暂停共享时停止自动同步。",
+                Button::new("auto-clipboard-toggle")
+                    .label(if self.config.auto_clipboard {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.config.auto_clipboard = !this.config.auto_clipboard;
+                        this.runtime
+                            .exchange
+                            .auto_clipboard
+                            .store(this.config.auto_clipboard, Ordering::SeqCst);
+                        this.persist();
+                        cx.notify();
+                    })),
+            ))
+            .child(option_row(
+                "文件传输速率",
+                "默认 8 MiB/s。网络较慢或鼠标不流畅时可调低；0 表示不限速。",
+                div()
+                    .h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .children([1, 4, 8, 16, 32, 0].into_iter().map(|rate| {
+                        Button::new(format!("transfer-rate-{rate}"))
+                            .small()
+                            .label(if rate == 0 {
+                                "不限速".into()
+                            } else {
+                                format!("{rate}")
+                            })
+                            .disabled(rate == self.config.transfer_rate_mib)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.config.transfer_rate_mib = rate;
+                                this.runtime.exchange.set_rate_mib(rate);
+                                this.persist();
+                                cx.notify();
+                            }))
+                    })),
             ))
             .child(option_row(
                 "紧急返回",
@@ -1081,8 +1374,8 @@ impl Workspace {
             .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("一套键鼠，自由连接。"))
             .child(subtle(format!("MWB Rust · {} 预览版", env!("CARGO_PKG_VERSION"))))
             .child(div().text_sm().child("以 Rust + GPUI Kit 重写 Mouse without Borders 的核心使用流程。"))
-            .child(div().text_sm().child("当前支持：最多 16 台设备的工作组、按真实分辨率自由拖拽布局、任意设备之间的键鼠切换、自动重连和手动文本剪贴板。"))
-            .child(div().text_sm().child("后续计划：自动发现、文件传输、托盘与后台服务。"))
+            .child(div().text_sm().child("当前支持：多设备工作组、自由屏幕布局、键鼠共享、自动文本/图片剪贴板、无固定大小上限的文件传输。"))
+            .child(div().text_sm().child("后续计划：跨电脑粘贴文件、自动发现、托盘与后台服务。"))
             .child(div().text_sm().child("两端均需运行本重写版。普通用户权限下运行，当前不支持 UAC 安全桌面。"))
             .child(div().text_xs().text_color(rgb(MUTED)).child("Native UI · GPUI Kit 0.8.1  /  Transport · Noise + ChaCha20-Poly1305"))
     }
@@ -1232,6 +1525,7 @@ impl Render for Workspace {
                                 el.child(self.devices(cx))
                                     .child(self.connections(cx))
                                     .child(self.sharing(cx))
+                                    .child(self.transfers(cx))
                             })
                             .when(self.tab == 1, |el| el.child(self.preferences(cx)))
                             .when(self.tab == 2, |el| el.child(self.about()))
