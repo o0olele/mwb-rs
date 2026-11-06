@@ -1,5 +1,6 @@
 use super::*;
 use crate::exchange::clipboard::Content;
+use crate::exchange::paste::RemoteFiles;
 use crate::layout::{Rect, test_device};
 use std::{
     collections::HashSet,
@@ -18,6 +19,7 @@ struct Probe {
     clipboard_sequence: AtomicU64,
     clipboard_writes: AtomicU64,
     clipboard_files: Mutex<Vec<std::path::PathBuf>>,
+    remote_files: Mutex<Option<RemoteFiles>>,
     fail_enable: AtomicBool,
     fail_enter: AtomicBool,
     fail_apply: AtomicBool,
@@ -102,6 +104,35 @@ impl SessionInput for FakeInput {
 }
 struct FakeClipboard(Arc<Probe>);
 impl Backend for FakeClipboard {
+    fn has_files(&mut self) -> bool {
+        !self.0.clipboard_files.lock().unwrap().is_empty()
+    }
+    fn owns_files(&mut self) -> bool {
+        self.0.remote_files.lock().unwrap().is_some()
+    }
+    fn write_files(&mut self, files: RemoteFiles) -> Result<()> {
+        *self.0.remote_files.lock().unwrap() = Some(files);
+        *self.0.clipboard_content.lock().unwrap() = None;
+        self.0.clipboard_files.lock().unwrap().clear();
+        self.0.clipboard_sequence.fetch_add(1, Ordering::SeqCst);
+        self.0.clipboard_writes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn clear_files(&mut self) -> Result<()> {
+        if self.0.remote_files.lock().unwrap().take().is_some() {
+            self.0.clipboard_sequence.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    fn maintain(&mut self, active: bool) -> Result<()> {
+        if !active {
+            self.clear_files()?;
+        }
+        Ok(())
+    }
+    fn finish(&mut self) {
+        let _ = self.clear_files();
+    }
     fn files(&mut self) -> Result<Vec<std::path::PathBuf>> {
         Ok(self.0.clipboard_files.lock().unwrap().clone())
     }
@@ -120,6 +151,8 @@ impl Backend for FakeClipboard {
             self.0.clipboard.lock().unwrap().push(text);
         }
         *self.0.clipboard_content.lock().unwrap() = Some(content.clone());
+        self.0.remote_files.lock().unwrap().take();
+        self.0.clipboard_files.lock().unwrap().clear();
         self.0.clipboard_sequence.fetch_add(1, Ordering::SeqCst);
         self.0.clipboard_writes.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -638,8 +671,490 @@ fn stopping_client_cancels_pending_handshake() {
 }
 
 fn local_copy(probe: &Probe, content: Content) {
+    probe.remote_files.lock().unwrap().take();
+    probe.clipboard_files.lock().unwrap().clear();
     *probe.clipboard_content.lock().unwrap() = Some(content);
     probe.clipboard_sequence.fetch_add(1, Ordering::SeqCst);
+}
+
+fn local_copy_files(probe: &Probe, paths: Vec<std::path::PathBuf>) {
+    probe.remote_files.lock().unwrap().take();
+    *probe.clipboard_content.lock().unwrap() = None;
+    *probe.clipboard_files.lock().unwrap() = paths;
+    probe.clipboard_sequence.fetch_add(1, Ordering::SeqCst);
+}
+fn remote_files(probe: &Probe) -> RemoteFiles {
+    wait(|| probe.remote_files.lock().unwrap().is_some());
+    probe.remote_files.lock().unwrap().clone().unwrap()
+}
+
+#[test]
+fn native_paste_advertises_metadata_then_pulls_verified_files_only_on_demand() {
+    use crate::exchange::Phase;
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let paths = vec![
+        source.path().join("中文🙂.bin"),
+        source.path().join("empty.txt"),
+    ];
+    let bytes: Vec<_> = (0..240_000).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&paths[0], &bytes).unwrap();
+    std::fs::write(&paths[1], []).unwrap();
+    local_copy_files(&c.probes[1], paths.clone());
+    let remote = remote_files(&c.probes[2]);
+    let hub = remote_files(&c.probes[0]);
+    assert_eq!(remote.entries()[0].name, "中文🙂.bin");
+    assert_eq!(remote.entries()[0].size, bytes.len() as u64);
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        c.nodes.iter().all(|rt| rt.exchange.snapshot().is_empty()),
+        "copy eagerly downloaded file bodies"
+    );
+    let fetch = remote.fetch(0).unwrap();
+    let path = fetch.wait(|| {}).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let empty = remote.fetch(1).unwrap();
+    let empty_path = empty.wait(|| {}).unwrap();
+    assert_eq!(std::fs::metadata(empty_path).unwrap().len(), 0);
+    assert!(
+        Arc::ptr_eq(&fetch, &remote.fetch(0).unwrap()),
+        "repeat paste did not reuse verified cache"
+    );
+    wait(|| {
+        c.nodes[1]
+            .exchange
+            .snapshot()
+            .iter()
+            .all(|t| t.phase == Phase::Complete)
+    });
+    assert_eq!(c.nodes[1].exchange.snapshot().len(), 2);
+    assert!(
+        c.nodes[0].exchange.snapshot().is_empty(),
+        "hub materialized relayed file"
+    );
+    assert!(
+        c.nodes[2]
+            .exchange
+            .snapshot()
+            .iter()
+            .all(|t| t.phase == Phase::Complete && t.path.is_none())
+    );
+    assert_eq!(
+        c.probes[1].clipboard_writes.load(Ordering::SeqCst),
+        0,
+        "file clipboard echoed"
+    );
+    // Releasing clipboard and every stream releases only their generated cache directories.
+    local_copy(&c.probes[2], Content::text("new copy".into()));
+    drop(hub);
+    drop(remote);
+    drop(empty);
+    drop(fetch);
+    wait(|| !path.exists());
+    assert_eq!(
+        std::fs::read(&paths[0]).unwrap(),
+        bytes,
+        "paste altered source file"
+    );
+}
+
+#[test]
+fn paste_cancellation_cleans_partial_cache_and_allows_retry_while_input_keeps_working() {
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("cancel-paste.bin");
+    let bytes = vec![29; 2 * 1024 * 1024];
+    std::fs::write(&path, &bytes).unwrap();
+    c.nodes[2].exchange.set_rate_mib(1);
+    local_copy_files(&c.probes[1], vec![path]);
+    let remote = remote_files(&c.probes[2]);
+    let cancelled = remote.fetch(0).unwrap();
+    wait(|| {
+        c.nodes[2]
+            .exchange
+            .snapshot()
+            .iter()
+            .any(|t| t.transferred > 0)
+    });
+    c.control(1, 2);
+    c.key(1, 65);
+    wait(|| c.probes[2].held.lock().unwrap().contains(&65));
+    remote.cancel();
+    assert!(cancelled.wait(|| {}).is_err());
+    wait(|| {
+        c.nodes[2]
+            .exchange
+            .snapshot()
+            .iter()
+            .all(|t| t.phase.terminal())
+    });
+    assert_eq!(std::fs::read_dir(&cancelled.directory).unwrap().count(), 0);
+    let directory = cancelled.directory.clone();
+    let retried = remote.fetch(0).unwrap();
+    assert_ne!(cancelled.id, retried.id);
+    drop(cancelled);
+    assert!(!directory.exists());
+    assert_eq!(std::fs::read(retried.wait(|| {}).unwrap()).unwrap(), bytes);
+    assert!(c.nodes.iter().all(|rt| rt.sharing_enabled()));
+}
+
+#[test]
+fn changed_sources_and_replaced_clipboards_reject_stale_paste_without_breaking_input() {
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("changed.txt");
+    std::fs::write(&path, b"before").unwrap();
+    local_copy_files(&c.probes[1], vec![path.clone()]);
+    let remote = remote_files(&c.probes[2]);
+    std::fs::write(&path, b"changed after copy").unwrap();
+    let fetch = remote.fetch(0).unwrap();
+    wait(|| fetch.failed());
+    assert!(format!("{:#}", fetch.wait(|| {}).unwrap_err()).contains("重新复制"));
+    local_copy(&c.probes[1], Content::text("replaced".into()));
+    wait(|| clipboard_bytes(&c.probes[2]) == b"replaced");
+    assert!(remote.fetch(0).is_err());
+    c.control(1, 2);
+    c.key(1, 66);
+    wait(|| c.probes[2].held.lock().unwrap().contains(&66));
+}
+
+#[test]
+fn source_disconnect_unblocks_native_paste_and_cleans_the_partial_cache() {
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("disconnect.bin");
+    std::fs::write(&path, vec![11; 4 * 1024 * 1024]).unwrap();
+    c.nodes[2].exchange.set_rate_mib(1);
+    local_copy_files(&c.probes[1], vec![path]);
+    let remote = remote_files(&c.probes[2]);
+    let fetch = remote.fetch(0).unwrap();
+    wait(|| {
+        c.nodes[2]
+            .exchange
+            .snapshot()
+            .iter()
+            .any(|t| t.transferred > 0)
+    });
+    c.nodes[1].stop();
+    wait(|| fetch.failed());
+    assert!(fetch.wait(|| {}).is_err());
+    wait(|| std::fs::read_dir(&fetch.directory).unwrap().count() == 0);
+    assert!(c.nodes[2].snapshot().connected && c.nodes[2].exchange.ready());
+    c.control(2, 0);
+    c.key(2, 67);
+    wait(|| c.probes[0].held.lock().unwrap().contains(&67));
+}
+
+#[test]
+fn unsupported_file_copy_revokes_remote_files_and_pause_blocks_new_paste() {
+    let c = Cluster::new(2);
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("source.txt");
+    std::fs::write(&path, b"content").unwrap();
+    local_copy_files(&c.probes[0], vec![path.clone()]);
+    let remote = remote_files(&c.probes[1]);
+    c.nodes[1]
+        .exchange
+        .auto_clipboard
+        .store(false, Ordering::SeqCst);
+    wait(|| c.probes[1].remote_files.lock().unwrap().is_none());
+    assert!(remote.fetch(0).is_err());
+    c.nodes[1]
+        .exchange
+        .auto_clipboard
+        .store(true, Ordering::SeqCst);
+    local_copy_files(&c.probes[0], vec![path]);
+    let remote = remote_files(&c.probes[1]);
+    local_copy_files(&c.probes[0], vec![source.path().into()]);
+    wait(|| c.probes[1].remote_files.lock().unwrap().is_none());
+    assert!(remote.fetch(0).is_err());
+    assert!(c.nodes.iter().all(|rt| rt.sharing_enabled()));
+}
+
+#[cfg(windows)]
+#[test]
+fn native_paste_streams_work_through_com_marshalling_and_support_seek_clone_and_eof() {
+    use crate::exchange::windows_clipboard::{data_object, pump};
+    use windows::{
+        Win32::{
+            Foundation::{S_FALSE, S_OK},
+            System::{
+                Com::*,
+                DataExchange::RegisterClipboardFormatW,
+                Ole::{OleInitialize, OleUninitialize, ReleaseStgMedium},
+            },
+            UI::Shell::{CFSTR_FILECONTENTS, IDataObjectAsyncCapability},
+        },
+        core::{AgileReference, Interface},
+    };
+    // Own COM apartments only; never touch the machine's real clipboard or keyboard hooks.
+    struct Apartment;
+    impl Apartment {
+        fn new() -> Self {
+            unsafe {
+                OleInitialize(None).unwrap();
+            }
+            Self
+        }
+    }
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe {
+                OleUninitialize();
+            }
+        }
+    }
+    let _apartment = Apartment::new();
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("stream.bin");
+    let bytes: Vec<_> = (0..130_123).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&path, &bytes).unwrap();
+    local_copy_files(&c.probes[1], vec![path]);
+    let object = data_object(remote_files(&c.probes[2])).unwrap();
+    let agile = AgileReference::new(&object).unwrap();
+    let consumer = thread::spawn(move || {
+        let _apartment = Apartment::new();
+        let object = agile.resolve().unwrap();
+        let operations: IDataObjectAsyncCapability = object.cast().unwrap();
+        unsafe {
+            operations.StartOperation(None).unwrap();
+            assert!(operations.InOperation().unwrap().as_bool());
+            let request = FORMATETC {
+                cfFormat: RegisterClipboardFormatW(CFSTR_FILECONTENTS) as u16,
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: 0,
+                tymed: TYMED_ISTREAM.0 as u32,
+                ..Default::default()
+            };
+            let mut medium = object.GetData(&request).unwrap();
+            let stream = medium.u.pstm.as_ref().unwrap().clone();
+            ReleaseStgMedium(&mut medium);
+            let mut stat = STATSTG::default();
+            stream.Stat(&mut stat, STATFLAG_NONAME).unwrap();
+            assert_eq!(stat.cbSize, bytes.len() as u64);
+            let mut first = [0u8; 17];
+            let mut got = 0;
+            assert_eq!(
+                stream.Read(first.as_mut_ptr().cast(), 17, Some(&mut got)),
+                S_OK
+            );
+            assert_eq!(got, 17);
+            assert_eq!(first, bytes[..17]);
+            let clone = stream.Clone().unwrap();
+            stream.Seek(-5, STREAM_SEEK_END, None).unwrap();
+            let mut tail = [0u8; 10];
+            assert_eq!(
+                stream.Read(tail.as_mut_ptr().cast(), 10, Some(&mut got)),
+                S_FALSE
+            );
+            assert_eq!(got, 5);
+            assert_eq!(tail[..5], bytes[bytes.len() - 5..]);
+            assert_eq!(
+                stream.Read(tail.as_mut_ptr().cast(), 10, Some(&mut got)),
+                S_FALSE
+            );
+            assert_eq!(got, 0);
+            let mut remaining = vec![0; bytes.len() - 17];
+            assert_eq!(
+                clone.Read(
+                    remaining.as_mut_ptr().cast(),
+                    remaining.len() as u32,
+                    Some(&mut got)
+                ),
+                S_OK
+            );
+            assert_eq!(remaining, bytes[17..]);
+            assert!(clone.Seek(-1, STREAM_SEEK_SET, None).is_err());
+            assert!(clone.Write(first.as_ptr().cast(), 17, None).is_err());
+            operations.EndOperation(S_OK, None, 1).unwrap();
+            assert!(!operations.InOperation().unwrap().as_bool());
+        }
+    });
+    let started = Instant::now();
+    while !consumer.is_finished() {
+        pump();
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "COM paste consumer timed out"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    consumer.join().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires Windows Shell; copies only test data without touching the system clipboard"]
+fn windows_shell_pastes_virtual_files_into_a_folder() {
+    use crate::exchange::windows_clipboard::{data_object, pump};
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::{
+            Foundation::POINTL,
+            System::{
+                Ole::{DROPEFFECT_COPY, IDropTarget, OleInitialize, OleUninitialize},
+                SystemServices::{MK_CONTROL, MK_LBUTTON},
+            },
+            UI::Shell::{
+                BHID_SFUIObject, IDataObjectAsyncCapability, IShellItem,
+                SHCreateItemFromParsingName,
+            },
+        },
+        core::{Interface, PCWSTR},
+    };
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe {
+                OleUninitialize();
+            }
+        }
+    }
+    unsafe {
+        OleInitialize(None).unwrap();
+    }
+    let _apartment = Apartment;
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let paths = vec![
+        source.path().join("粘贴🙂.bin"),
+        source.path().join("empty.txt"),
+    ];
+    let bytes: Vec<_> = (0..130_123).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&paths[0], &bytes).unwrap();
+    std::fs::write(&paths[1], []).unwrap();
+    local_copy_files(&c.probes[1], paths.clone());
+    let object = data_object(remote_files(&c.probes[2])).unwrap();
+    unsafe {
+        let operations: IDataObjectAsyncCapability = object.cast().unwrap();
+        assert!(operations.GetAsyncMode().unwrap().as_bool());
+        let directory: Vec<_> = destination
+            .path()
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let folder: IShellItem =
+            SHCreateItemFromParsingName(PCWSTR(directory.as_ptr()), None).unwrap();
+        let target: IDropTarget = folder.BindToHandler(None, &BHID_SFUIObject).unwrap();
+        let mut effect = DROPEFFECT_COPY;
+        target
+            .DragEnter(
+                &object,
+                MK_CONTROL | MK_LBUTTON,
+                POINTL::default(),
+                &mut effect,
+            )
+            .unwrap();
+        assert_eq!(effect, DROPEFFECT_COPY);
+        target
+            .Drop(&object, MK_CONTROL, POINTL::default(), &mut effect)
+            .unwrap();
+        assert_eq!(effect, DROPEFFECT_COPY);
+        let started = Instant::now();
+        while operations.InOperation().unwrap().as_bool()
+            || !std::fs::metadata(destination.path().join("粘贴🙂.bin"))
+                .is_ok_and(|m| m.len() == bytes.len() as u64)
+            || !destination.path().join("empty.txt").exists()
+        {
+            pump();
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "asynchronous Shell paste timed out"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let files: Vec<_> = std::fs::read_dir(destination.path())
+        .unwrap()
+        .map(|f| f.unwrap().path())
+        .collect();
+    assert_eq!(
+        files.len(),
+        2,
+        "Shell did not materialize both virtual files"
+    );
+    assert_eq!(
+        std::fs::read(destination.path().join("粘贴🙂.bin")).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        std::fs::metadata(destination.path().join("empty.txt"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(files.iter().any(|p| std::fs::read(p).unwrap() == bytes));
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
+    eprintln!("Windows Shell copied two virtual files through a three-device relay");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "writes and relays 128 MiB through native IStream; run explicitly for release validation"]
+fn native_clipboard_paste_larger_than_original_100mb_limit_streams_end_to_end() {
+    use crate::exchange::windows_clipboard::data_object;
+    use sha2::{Digest, Sha256};
+    use windows::Win32::{
+        System::{Com::*, DataExchange::RegisterClipboardFormatW, Ole::ReleaseStgMedium},
+        UI::Shell::CFSTR_FILECONTENTS,
+    };
+    let c = Cluster::new(3);
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("128MiB-paste.bin");
+    let block: Vec<_> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut file = std::fs::File::create(&path).unwrap();
+    let mut expected = Sha256::new();
+    for _ in 0..128 {
+        file.write_all(&block).unwrap();
+        expected.update(&block);
+    }
+    drop(file);
+    local_copy_files(&c.probes[1], vec![path]);
+    let remote = remote_files(&c.probes[2]);
+    assert_eq!(remote.entries()[0].size, 128 * 1024 * 1024);
+    assert!(c.nodes[1].exchange.snapshot().is_empty());
+    let object = data_object(remote).unwrap();
+    let mut actual = Sha256::new();
+    let mut total = 0;
+    let start = Instant::now();
+    unsafe {
+        let request = FORMATETC {
+            cfFormat: RegisterClipboardFormatW(CFSTR_FILECONTENTS) as u16,
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: 0,
+            tymed: TYMED_ISTREAM.0 as u32,
+            ..Default::default()
+        };
+        let mut medium = object.GetData(&request).unwrap();
+        let stream = medium.u.pstm.as_ref().unwrap().clone();
+        ReleaseStgMedium(&mut medium);
+        let mut buffer = [0u8; 32768];
+        loop {
+            let mut got = 0;
+            stream
+                .Read(
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    Some(&mut got),
+                )
+                .ok()
+                .unwrap();
+            if got == 0 {
+                break;
+            }
+            total += u64::from(got);
+            actual.update(&buffer[..got as usize]);
+        }
+    }
+    assert_eq!(total, 128 * 1024 * 1024);
+    assert_eq!(actual.finalize(), expected.finalize());
+    eprintln!(
+        "128 MiB native clipboard IStream, three-device relay and SHA-256 verified: {:?}",
+        start.elapsed()
+    );
 }
 fn clipboard_bytes(probe: &Probe) -> Vec<u8> {
     probe

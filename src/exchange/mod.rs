@@ -2,8 +2,11 @@
 pub(crate) mod clipboard;
 mod files;
 mod net;
+pub(crate) mod paste;
 #[cfg(test)]
 mod tests;
+#[cfg(windows)]
+pub(crate) mod windows_clipboard;
 mod wire;
 use crate::{config::Config, engine::Runtime};
 use anyhow::{Context, Result, bail, ensure};
@@ -73,6 +76,7 @@ pub struct Exchange {
     pub(crate) join: net::JoinSlot,
     pub(crate) clipboard_version: Mutex<ClipboardVersion>,
     pub(crate) clipboard_clock: AtomicU64,
+    exports: Mutex<Option<paste::Export>>,
     commands: Mutex<Option<SyncSender<Command>>>,
     clipboard: Mutex<Option<SyncSender<Request>>>,
     transfers: Mutex<VecDeque<Transfer>>,
@@ -80,6 +84,7 @@ pub struct Exchange {
     connections: AtomicUsize,
 }
 enum Command {
+    Fetch(Arc<paste::Fetch>),
     Files {
         target: String,
         paths: Vec<PathBuf>,
@@ -107,6 +112,7 @@ impl Exchange {
             join: Arc::new(Mutex::new(None)),
             clipboard_version: Mutex::new(ClipboardVersion::default()),
             clipboard_clock: AtomicU64::new(0),
+            exports: Mutex::new(None),
             commands: Mutex::new(None),
             clipboard: Mutex::new(None),
             transfers: Mutex::new(VecDeque::new()),
@@ -150,6 +156,9 @@ impl Exchange {
     }
     pub fn cancel(&self, id: String) -> Result<()> {
         self.command(Command::Cancel(id))
+    }
+    fn fetch(&self, fetch: Arc<paste::Fetch>) -> Result<()> {
+        self.command(Command::Fetch(fetch))
     }
     pub fn send_clipboard(&self, target: String) -> Result<()> {
         self.clip_request(Request::Read { target })
@@ -261,6 +270,7 @@ pub(crate) fn launch(
             links: BTreeMap::new(),
             outgoing: BTreeMap::new(),
             incoming: BTreeMap::new(),
+            fetches: BTreeMap::new(),
             routes: VecDeque::new(),
             clipboard: clip_tx,
             pump_cursor: 0,
@@ -297,12 +307,21 @@ pub(crate) fn launch(
         for (_, link) in worker.links.values() {
             link.closed.store(true, Ordering::SeqCst);
         }
-        for id in worker.outgoing.keys().chain(worker.incoming.keys()) {
+        for id in worker
+            .outgoing
+            .keys()
+            .chain(worker.incoming.keys())
+            .chain(worker.fetches.keys())
+        {
             rt.exchange.update(id, |t| {
                 t.phase = Phase::Cancelled;
                 t.detail = "工作组已停止".into();
             });
         }
+        for (fetch, _) in worker.fetches.values() {
+            fetch.fail("工作组已停止".into());
+        }
+        *rt.exchange.exports.lock().unwrap() = None;
         drop(worker); // closes source files and removes unfinished receiving files
         *rt.exchange.commands.lock().unwrap() = None;
         *rt.exchange.clipboard.lock().unwrap() = None;
@@ -364,6 +383,7 @@ struct Worker {
     links: BTreeMap<String, (u64, net::Link)>,
     outgoing: BTreeMap<String, Outgoing>,
     incoming: BTreeMap<String, Incoming>,
+    fetches: BTreeMap<String, (Arc<paste::Fetch>, Instant)>,
     routes: VecDeque<Packet>,
     clipboard: SyncSender<Request>,
     pump_cursor: usize,
@@ -429,10 +449,26 @@ impl Worker {
         source: Source,
         version: Option<ClipboardVersion>,
     ) -> Result<()> {
+        self.offer_as(wire::new_id(), peer, kind, size, source, version)
+    }
+    fn offer_as(
+        &mut self,
+        id: String,
+        peer: String,
+        kind: Kind,
+        size: u64,
+        source: Source,
+        version: Option<ClipboardVersion>,
+    ) -> Result<()> {
         ensure!(self.connected(&peer), "目标设备离线或文件通道尚未就绪");
         ensure!(self.outgoing.len() < 64, "正在等待或发送的任务过多");
+        ensure!(
+            !self.outgoing.contains_key(&id)
+                && !self.incoming.contains_key(&id)
+                && !self.fetches.contains_key(&id),
+            "重复的文件请求"
+        );
         kind.validate(size)?;
-        let id = wire::new_id();
         if let Kind::File { name } = &kind {
             self.rt.exchange.add(Transfer {
                 id: id.clone(),
@@ -474,6 +510,46 @@ impl Worker {
     }
     fn command(&mut self, command: Command) -> Result<()> {
         match command {
+            Command::Fetch(fetch) => {
+                let result = (|| -> Result<()> {
+                    ensure!(
+                        self.rt.sharing_enabled()
+                            && self.rt.exchange.auto_clipboard.load(Ordering::SeqCst),
+                        "剪贴板共享已关闭"
+                    );
+                    ensure!(self.connected(&fetch.source), "文件来源设备离线");
+                    ensure!(
+                        self.fetches.len() < 64 && !fetch.failed(),
+                        "粘贴任务已取消或任务过多"
+                    );
+                    self.rt.exchange.add(Transfer {
+                        id: fetch.id.clone(),
+                        peer: fetch.source.clone(),
+                        name: fetch.entry.name.clone(),
+                        size: fetch.entry.size,
+                        transferred: 0,
+                        incoming: true,
+                        phase: Phase::Receiving,
+                        path: None,
+                        detail: "正在为 Windows 粘贴准备文件".into(),
+                    });
+                    self.queue(self.packet(
+                        &fetch.source,
+                        Event::Pull {
+                            id: fetch.id.clone(),
+                            clipboard: fetch.clipboard.clone(),
+                            index: fetch.index,
+                        },
+                    ));
+                    self.fetches
+                        .insert(fetch.id.clone(), (fetch.clone(), Instant::now()));
+                    Ok(())
+                })();
+                if let Err(e) = &result {
+                    fetch.fail(format!("{e:#}"));
+                }
+                result?;
+            }
             Command::Files { target, paths } => {
                 ensure!(self.connected(&target), "目标设备的文件通道尚未就绪");
                 ensure!(
@@ -659,7 +735,8 @@ impl Worker {
                     if let Some(id) = id {
                         // Only the owner of a transfer can mutate or cancel it.
                         let owned = self.outgoing.get(&id).is_some_and(|t| t.peer == peer)
-                            || self.incoming.get(&id).is_some_and(|t| t.peer == peer);
+                            || self.incoming.get(&id).is_some_and(|t| t.peer == peer)
+                            || self.fetches.get(&id).is_some_and(|(f, _)| f.source == peer);
                         if owned {
                             self.fail(&id, detail.clone(), Phase::Failed);
                         } else {
@@ -695,6 +772,12 @@ impl Worker {
                     .filter(|(_, t)| !self.host || t.peer == peer)
                     .map(|(id, _)| id.clone()),
             )
+            .chain(
+                self.fetches
+                    .iter()
+                    .filter(|(_, (f, _))| !self.host || f.source == peer)
+                    .map(|(id, _)| id.clone()),
+            )
             .collect();
         for id in ids {
             self.fail(&id, "文件通道中断，请重新发送".into(), Phase::Failed);
@@ -705,11 +788,15 @@ impl Worker {
             .store(!self.links.is_empty(), Ordering::SeqCst);
     }
     fn fail(&mut self, id: &str, reason: String, phase: Phase) {
-        let peer = self
+        let mut peer = self
             .outgoing
             .remove(id)
             .map(|t| t.peer)
             .or_else(|| self.incoming.remove(id).map(|t| t.peer));
+        if let Some((fetch, _)) = self.fetches.remove(id) {
+            fetch.fail(reason.clone());
+            peer = Some(fetch.source.clone());
+        }
         self.routes.retain(|p| p.header.event.id() != Some(id));
         if let Some(peer) = peer {
             self.queue(self.packet(
@@ -729,6 +816,34 @@ impl Worker {
         let peer = packet.header.source;
         ensure!(wire::valid_id(&peer), "发送设备无效");
         match packet.header.event {
+            Event::Pull {
+                id,
+                clipboard,
+                index,
+            } => {
+                ensure!(
+                    self.rt.sharing_enabled()
+                        && self.rt.exchange.auto_clipboard.load(Ordering::SeqCst),
+                    "源设备已关闭剪贴板共享"
+                );
+                let (file, entry) = {
+                    let exports = self.rt.exchange.exports.lock().unwrap();
+                    let export = exports.as_ref().context("文件剪贴板已失效，请重新复制")?;
+                    ensure!(
+                        *self.rt.exchange.clipboard_version.lock().unwrap() == export.version,
+                        "剪贴板已更新，请重新复制文件"
+                    );
+                    export.open(&clipboard, index)?
+                };
+                self.offer_as(
+                    id,
+                    peer,
+                    Kind::File { name: entry.name },
+                    entry.size,
+                    Source::File(file),
+                    None,
+                )?;
+            }
             Event::Clock { clock } => {
                 ensure!(!self.host && clock < u64::MAX - 1, "剪贴板时钟无效");
                 self.rt
@@ -750,22 +865,47 @@ impl Worker {
                     "重复传输或待接收任务过多"
                 );
                 kind.validate(size)?;
+                if let Some((fetch, _)) = self.fetches.get(&id) {
+                    ensure!(
+                        fetch.source == peer
+                            && kind
+                                == (Kind::File {
+                                    name: fetch.entry.name.clone()
+                                })
+                            && size == fetch.entry.size
+                            && !fetch.failed(),
+                        "文件粘贴响应与请求不符"
+                    );
+                }
                 let sink = if let Kind::File { name } = &kind {
                     ensure!(version.is_none(), "文件不支持自动剪贴板版本");
-                    self.rt.exchange.add(Transfer {
-                        id: id.clone(),
-                        peer: peer.clone(),
-                        name: name.clone(),
-                        size,
-                        transferred: 0,
-                        incoming: true,
-                        phase: Phase::Offered,
-                        path: None,
-                        detail: String::new(),
-                    });
-                    None
+                    if let Some((fetch, _)) = self.fetches.get(&id) {
+                        Some(Sink::File(Box::new(files::IncomingFile::create(
+                            &fetch.directory,
+                            "content.bin",
+                            &id,
+                            size,
+                        )?)))
+                    } else {
+                        self.rt.exchange.add(Transfer {
+                            id: id.clone(),
+                            peer: peer.clone(),
+                            name: name.clone(),
+                            size,
+                            transferred: 0,
+                            incoming: true,
+                            phase: Phase::Offered,
+                            path: None,
+                            detail: String::new(),
+                        });
+                        None
+                    }
                 } else {
                     ensure!(self.rt.sharing_enabled(), "共享已暂停");
+                    ensure!(
+                        !matches!(kind, Kind::FileList | Kind::ClearFiles) || version.is_some(),
+                        "文件剪贴板缺少版本"
+                    );
                     if let Some(version) = &version {
                         ensure!(
                             self.rt.exchange.auto_clipboard.load(Ordering::SeqCst)
@@ -855,11 +995,22 @@ impl Worker {
                 let t = self.incoming.remove(&id).unwrap();
                 self.rt.exchange.update(&id, |v| v.phase = Phase::Verifying);
                 let result = match t.sink.unwrap() {
-                    Sink::File(file) => file.finish(&digest).map(|path| {
+                    Sink::File(file) => file.finish(&digest).and_then(|path| {
+                        let pasted = if let Some((fetch, _)) = self.fetches.remove(&id) {
+                            ensure!(fetch.complete(path.clone()), "粘贴已取消");
+                            true
+                        } else {
+                            false
+                        };
                         self.rt.exchange.update(&id, |v| {
                             v.phase = Phase::Complete;
-                            v.path = Some(path);
+                            if pasted {
+                                v.detail = "已校验，交给 Windows 完成粘贴".into();
+                            } else {
+                                v.path = Some(path);
+                            }
                         });
+                        Ok(())
                     }),
                     Sink::Memory(bytes) => {
                         let content = Content {
@@ -878,6 +1029,9 @@ impl Worker {
                 };
                 if let Err(e) = result {
                     let detail = format!("{e:#}");
+                    if let Some((fetch, _)) = self.fetches.remove(&id) {
+                        fetch.fail(detail.clone());
+                    }
                     self.rt.exchange.update(&id, |v| {
                         v.phase = Phase::Failed;
                         v.detail = detail.clone();
@@ -899,12 +1053,16 @@ impl Worker {
             }
             Event::Cancel { id, reason } => {
                 ensure!(reason.len() <= 4096, "取消原因过长");
+                let fetching = self.fetches.get(&id).is_some_and(|(f, _)| f.source == peer);
                 if self.incoming.get(&id).is_some_and(|t| t.peer == peer) {
                     self.incoming.remove(&id);
                 } else if self.outgoing.get(&id).is_some_and(|t| t.peer == peer) {
                     self.outgoing.remove(&id);
-                } else {
+                } else if !fetching {
                     return Ok(());
+                }
+                if let Some((fetch, _)) = self.fetches.remove(&id) {
+                    fetch.fail(reason.clone());
                 }
                 self.routes
                     .retain(|p| p.header.event.id() != Some(id.as_str()));
@@ -918,6 +1076,37 @@ impl Worker {
         Ok(())
     }
     fn pump(&mut self) {
+        // A relayed source can go offline while our connection to the hub stays up.
+        // Cancel immediately on topology updates instead of leaving Explorer waiting for a timeout.
+        if !self.fetches.is_empty() {
+            let layout = self.rt.snapshot().layout;
+            let offline: Vec<_> = self
+                .fetches
+                .iter()
+                .filter(|(_, (f, _))| layout.get(&f.source).is_none_or(|d| !d.online))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in offline {
+                self.fail(
+                    &id,
+                    "文件来源设备已离线，请重连后重新粘贴".into(),
+                    Phase::Failed,
+                );
+            }
+        }
+        let expired: Vec<_> = self
+            .fetches
+            .iter()
+            .filter(|(id, (f, started))| {
+                f.failed()
+                    || (!self.incoming.contains_key(*id)
+                        && started.elapsed() > Duration::from_secs(60))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.fail(&id, "粘贴已取消或请求超时".into(), Phase::Failed);
+        }
         let mut ids: Vec<_> = self.outgoing.keys().cloned().collect();
         if !ids.is_empty() {
             let start = self.pump_cursor % ids.len();

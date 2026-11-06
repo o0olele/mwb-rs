@@ -255,7 +255,7 @@ fn connection(
                             };
                             ensure!(
                                 version == VERSION,
-                                "两端版本不同，需要所有设备均更新到 v0.4.0"
+                                "两端版本不同，需要所有设备均更新到 v0.5.0"
                             );
                             device.validate()?;
                             ensure!(

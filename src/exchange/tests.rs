@@ -2,6 +2,37 @@ use super::*;
 use std::fs;
 
 #[test]
+fn file_paste_exports_only_locally_copied_files_and_validates_token_and_index() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("allowed.txt");
+    fs::write(&path, b"allowed").unwrap();
+    let export = paste::Export::new(vec![path.clone()], ClipboardVersion::default()).unwrap();
+    assert!(export.open(&wire::new_id(), 0).is_err());
+    assert!(export.open(&export.manifest.token, 1).is_err());
+    let (mut file, entry) = export.open(&export.manifest.token, 0).unwrap();
+    let mut text = String::new();
+    file.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "allowed");
+    assert_eq!(entry.name, "allowed.txt");
+    assert_eq!(entry.size, 7);
+    let json = serde_json::to_string(&export.manifest).unwrap();
+    assert!(!json.contains(&directory.path().to_string_lossy().to_string()));
+    assert!(
+        paste::Export::new(vec![directory.path().into()], ClipboardVersion::default()).is_err()
+    );
+    for name in ["../outside", "C:\\secret", "x:stream", "CON"] {
+        let manifest = paste::Manifest {
+            token: wire::new_id(),
+            files: vec![paste::Entry {
+                name: name.into(),
+                size: u64::MAX,
+            }],
+        };
+        assert!(manifest.validate().is_err());
+    }
+}
+
+#[test]
 fn bulk_connection_requires_a_ticket_and_revokes_it_with_the_control_link() {
     use std::io::Write;
     use std::net::TcpStream;

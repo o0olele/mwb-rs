@@ -29,7 +29,7 @@ DeviceInfo 包含稳定 ID、名称、虚拟桌面物理像素边界和各显示
 
 ## 网络边界
 
-当前 v0.4.0 线协议为 4，所有设备必须升级。Hello 交换身份/屏幕；Topology 广播布局；Arrange 修改位置；TakeControl、Control、Release 管理控制；Input、Cursor 承载输入/反馈。DataChannel 协商独立的剪贴板/文件通道，详见 [数据传输设计](clipboard-files.md)。
+当前 v0.5.0 线协议为 5，所有设备必须升级。Hello 交换身份/屏幕；Topology 广播布局；Arrange 修改位置；TakeControl、Control、Release 管理控制；Input、Cursor 承载输入/反馈。DataChannel 协商独立的剪贴板/文件通道，详见 [数据传输设计](clipboard-files.md)。
 
 队列与帧大小有限，最多 16 台设备、每台 16 块屏幕，位置限制 ±1,000,000，尺寸上限 65,536。中心是可信节点，能看到转发内容；加密保护每条到中心的链路。暂不支持中心自动选举或完全分布式路由。
 

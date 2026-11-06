@@ -285,7 +285,7 @@ impl Workspace {
                                     .child("剪贴板与文件"),
                             )
                             .child(subtle(if self.config.auto_clipboard {
-                                "自动同步工作组的文本与图片 · 文件发送给选中设备"
+                                "自动同步文本、图片与文件列表 · 在对端文件夹按 Ctrl+V 粘贴文件"
                             } else {
                                 "自动剪贴板已关闭 · 仍可手动发送文本、图片和文件"
                             })),
@@ -1318,7 +1318,7 @@ impl Workspace {
             ))
             .child(option_row(
                 "自动剪贴板",
-                "将新复制的文本与图片同步到工作组；暂停共享时停止自动同步。",
+                "同步文本、图片与文件列表；文件在对端 Ctrl+V 时传输，暂停时停止自动同步。",
                 Button::new("auto-clipboard-toggle")
                     .label(if self.config.auto_clipboard {
                         "已开启"
@@ -1374,8 +1374,8 @@ impl Workspace {
             .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("一套键鼠，自由连接。"))
             .child(subtle(format!("MWB Rust · {} 预览版", env!("CARGO_PKG_VERSION"))))
             .child(div().text_sm().child("以 Rust + GPUI Kit 重写 Mouse without Borders 的核心使用流程。"))
-            .child(div().text_sm().child("当前支持：多设备工作组、自由屏幕布局、键鼠共享、自动文本/图片剪贴板、无固定大小上限的文件传输。"))
-            .child(div().text_sm().child("后续计划：跨电脑粘贴文件、自动发现、托盘与后台服务。"))
+            .child(div().text_sm().child("当前支持：多设备工作组、自由屏幕布局、键鼠共享、自动文本/图片剪贴板、跨设备 Ctrl+V 粘贴文件与不限大小的文件传输。"))
+            .child(div().text_sm().child("后续计划：文件夹传输、断点续传、自动发现、托盘与后台服务。"))
             .child(div().text_sm().child("两端均需运行本重写版。普通用户权限下运行，当前不支持 UAC 安全桌面。"))
             .child(div().text_xs().text_color(rgb(MUTED)).child("Native UI · GPUI Kit 0.8.1  /  Transport · Noise + ChaCha20-Poly1305"))
     }

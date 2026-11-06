@@ -1,6 +1,6 @@
 use crate::layout::{DeviceInfo, Layout, Placement, Point};
 use serde::{Deserialize, Serialize};
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MouseMode {
     #[default]

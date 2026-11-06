@@ -17,10 +17,20 @@ pub enum Kind {
     File { name: String },
     Text,
     Image { width: u32, height: u32 },
+    FileList,
+    ClearFiles,
 }
 impl Kind {
     pub fn validate(&self, size: u64) -> Result<()> {
         match self {
+            Self::FileList => {
+                ensure!(size <= 128 * 1024, "文件列表过大");
+                Ok(())
+            }
+            Self::ClearFiles => {
+                ensure!(size == 0, "文件剪贴板清理消息无效");
+                Ok(())
+            }
             Self::File { name } => super::files::validate_name(name),
             Self::Text => {
                 ensure!(size <= TEXT_LIMIT, "剪贴板文本超过 16 MiB");
@@ -48,6 +58,11 @@ impl Kind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Event {
+    Pull {
+        id: String,
+        clipboard: String,
+        index: u32,
+    },
     Join {
         ticket: String,
     },
@@ -83,6 +98,7 @@ pub enum Event {
 impl Event {
     pub fn id(&self) -> Option<&str> {
         match self {
+            Self::Pull { id, .. } => Some(id),
             Self::Offer { id, .. }
             | Self::Accept { id }
             | Self::Chunk { id, .. }
