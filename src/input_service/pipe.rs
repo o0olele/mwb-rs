@@ -2,7 +2,7 @@ use super::{
     identity::{Descriptor, Handle},
     wire::{self, MAX_MESSAGE},
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use std::time::{Duration, Instant};
 use windows::{
@@ -106,10 +106,11 @@ impl Pipe {
         let handle = match result {
             Ok(handle) => Handle(handle),
             Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error).context("CreateFileW 打开本地管道"),
         };
         unsafe {
-            SetNamedPipeHandleState(handle.0, Some(&PIPE_READMODE_MESSAGE), None, None)?;
+            SetNamedPipeHandleState(handle.0, Some(&PIPE_READMODE_MESSAGE), None, None)
+                .context("设置管道消息读取模式")?;
         }
         Ok(Some(Self { handle }))
     }
@@ -248,6 +249,14 @@ mod tests {
             let _: Request = server.receive(TIMEOUT).unwrap();
         });
         let client = Pipe::open(&name).unwrap().unwrap();
+        let mut server_pid = 0;
+        let mut server_session = 0;
+        unsafe {
+            GetNamedPipeServerProcessId(client.handle.0, &mut server_pid).unwrap();
+            GetNamedPipeServerSessionId(client.handle.0, &mut server_session).unwrap();
+        }
+        assert_eq!(server_pid, unsafe { GetCurrentProcessId() });
+        assert_eq!(server_session, identity::current_session().unwrap());
         client
             .send(&Request {
                 version: VERSION,

@@ -1,4 +1,6 @@
 #[cfg(windows)]
+mod receiver;
+#[cfg(windows)]
 mod windows;
 use std::{error::Error, fmt};
 #[cfg(windows)]

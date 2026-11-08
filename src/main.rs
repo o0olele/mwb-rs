@@ -52,6 +52,7 @@ struct Workspace {
     view_offset: LayoutPoint,
     fit_pending: bool,
     notice: String,
+    input_service_notice: String,
     show_key: bool,
     preparing: bool,
     _refresh: Task<()>,
@@ -111,6 +112,7 @@ impl Workspace {
             view_offset: LayoutPoint { x: 32.0, y: 60.0 },
             fit_pending: true,
             notice,
+            input_service_notice: mwb::input_service::installation_notice().unwrap_or_default(),
             show_key: false,
             preparing: false,
             _refresh: refresh,
@@ -1152,6 +1154,18 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_sharing(cx))),
                     ),
             )
+            .when(!self.input_service_notice.is_empty(), |el| {
+                el.child(
+                    div()
+                        .rounded_md()
+                        .px_3()
+                        .py_2()
+                        .bg(rgb(0xFFF4DF))
+                        .text_color(rgb(0x856018))
+                        .text_xs()
+                        .child(self.input_service_notice.clone()),
+                )
+            })
             .child(
                 div()
                     .h_flex()

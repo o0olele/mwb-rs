@@ -5,7 +5,7 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
+        Foundation::{CloseHandle, ERROR_SERVICE_DOES_NOT_EXIST, HANDLE, HLOCAL, LocalFree},
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -14,11 +14,15 @@ use windows::{
             *,
         },
         System::{
+            Diagnostics::ToolHelp::*,
+            Pipes::{GetNamedPipeServerProcessId, GetNamedPipeServerSessionId},
             RemoteDesktop::{ProcessIdToSessionId, WTSQueryUserToken},
+            Services::*,
             Threading::*,
         },
+        UI::Shell::CommandLineToArgvW,
     },
-    core::{PCWSTR, PWSTR},
+    core::{HRESULT, PCWSTR, PWSTR},
 };
 
 pub(super) struct Handle(pub HANDLE);
@@ -55,6 +59,12 @@ impl Descriptor {
             bInheritHandle: false.into(),
         }
     }
+    fn apply_dacl(&self, object: HANDLE) -> Result<()> {
+        unsafe {
+            SetKernelObjectSecurity(object, DACL_SECURITY_INFORMATION, self.0)?;
+        }
+        Ok(())
+    }
 }
 impl Drop for Descriptor {
     fn drop(&mut self) {
@@ -67,9 +77,236 @@ impl Drop for Descriptor {
 pub(super) fn process_token(process: HANDLE) -> Result<Handle> {
     let mut token = HANDLE::default();
     unsafe {
-        OpenProcessToken(process, TOKEN_QUERY, &mut token)?;
+        OpenProcessToken(process, TOKEN_QUERY, &mut token)
+            .context("OpenProcessToken 读取对端账户令牌")?;
     }
     Ok(Handle(token))
+}
+
+pub(super) fn worker_process_descriptor(logon: &str) -> Result<Descriptor> {
+    Descriptor::new(&format!(
+        "O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00101000;;;{logon})"
+    ))
+}
+
+/// Permit only image/session queries and waiting. The client's trust proof uses
+/// the SCM-owned service and worker lineage; no SYSTEM token query is needed.
+pub(super) fn allow_worker_verification(logon: &str) -> Result<()> {
+    worker_process_descriptor(logon)?
+        .apply_dacl(unsafe { GetCurrentProcess() })
+        .context("设置输入代理进程查询权限")?;
+    Ok(())
+}
+
+struct ServiceHandle(SC_HANDLE);
+// SCM handles have no thread affinity and are exclusively owned by this value.
+unsafe impl Send for ServiceHandle {}
+impl Drop for ServiceHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseServiceHandle(self.0);
+        }
+    }
+}
+
+pub(super) struct VerifiedWorker {
+    _process: Handle,
+    _service: ServiceHandle,
+}
+
+struct RegisteredService {
+    handle: ServiceHandle,
+    image: PathBuf,
+}
+
+fn service_command_image(command: &str) -> Result<PathBuf> {
+    let command = super::pipe::wide(command);
+    let mut count = 0;
+    let args = unsafe { CommandLineToArgvW(PCWSTR(command.as_ptr()), &mut count) };
+    if args.is_null() {
+        return Err(windows::core::Error::from_win32()).context("解析输入服务启动命令");
+    }
+    let result = (|| {
+        ensure!(count == 2, "输入服务启动命令必须仅包含程序路径和 --service");
+        let args = unsafe { std::slice::from_raw_parts(args, 2) };
+        ensure!(
+            unsafe { args[1].to_string()? } == "--service",
+            "输入服务启动参数不匹配"
+        );
+        let image = PathBuf::from(unsafe { args[0].to_string()? });
+        ensure!(image.is_absolute(), "输入服务程序路径必须为绝对路径");
+        Ok(image)
+    })();
+    unsafe {
+        LocalFree(Some(HLOCAL(args.cast())));
+    }
+    result
+}
+
+fn registered_service() -> Result<Option<RegisteredService>> {
+    let manager = ServiceHandle(unsafe {
+        OpenSCManagerW(None, None, SC_MANAGER_CONNECT).context("连接本机服务管理器（只读）")?
+    });
+    let service_name = super::pipe::wide(super::SERVICE_NAME);
+    let service = match unsafe {
+        OpenServiceW(
+            manager.0,
+            PCWSTR(service_name.as_ptr()),
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    } {
+        Ok(handle) => ServiceHandle(handle),
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_SERVICE_DOES_NOT_EXIST.0) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("读取已注册的 MWB 输入服务"),
+    };
+    let mut needed = 0;
+    unsafe {
+        let _ = QueryServiceConfigW(service.0, None, 0, &mut needed);
+    }
+    ensure!(needed > 0 && needed <= 64 * 1024, "输入服务配置长度无效");
+    let mut buffer = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+    unsafe {
+        QueryServiceConfigW(
+            service.0,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+        .context("读取输入服务程序和账户配置")?;
+    }
+    let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
+    let account = unsafe { config.lpServiceStartName.to_string()? };
+    ensure!(
+        account.eq_ignore_ascii_case("LocalSystem")
+            || account.eq_ignore_ascii_case(r"NT AUTHORITY\SYSTEM"),
+        "输入服务未使用 LocalSystem 账户"
+    );
+    let command = unsafe { config.lpBinaryPathName.to_string()? };
+    let image = service_command_image(&command)?
+        .canonicalize()
+        .context("解析输入服务安装路径")?;
+    ensure!(
+        image
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(super::SERVICE_EXE)),
+        "输入服务程序名称不匹配"
+    );
+    Ok(Some(RegisteredService {
+        handle: service,
+        image,
+    }))
+}
+
+fn installed_client(service: &RegisteredService) -> Result<PathBuf> {
+    Ok(service
+        .image
+        .parent()
+        .context("服务安装目录无效")?
+        .join(super::CLIENT_EXE))
+}
+
+pub(super) fn installed_client_path() -> Result<Option<PathBuf>> {
+    registered_service()?
+        .map(|service| installed_client(&service))
+        .transpose()
+}
+
+fn running_service_pid(service: SC_HANDLE) -> Result<u32> {
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            (&mut status as *mut SERVICE_STATUS_PROCESS).cast(),
+            size_of::<SERVICE_STATUS_PROCESS>(),
+        )
+    };
+    let mut needed = 0;
+    unsafe {
+        QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, Some(bytes), &mut needed)
+            .context("查询输入服务运行状态")?;
+    }
+    ensure!(
+        status.dwCurrentState == SERVICE_RUNNING && status.dwProcessId != 0,
+        "锁屏输入服务尚未运行"
+    );
+    Ok(status.dwProcessId)
+}
+
+fn parent_process(pid: u32) -> Result<u32> {
+    let snapshot = Handle(unsafe {
+        CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).context("读取进程父子关系")?
+    });
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        Process32FirstW(snapshot.0, &mut entry)?;
+        loop {
+            if entry.th32ProcessID == pid {
+                return Ok(entry.th32ParentProcessID);
+            }
+            if Process32NextW(snapshot.0, &mut entry).is_err() {
+                break;
+            }
+        }
+    }
+    anyhow::bail!("输入代理进程已退出")
+}
+
+fn verify_worker_parent(worker: u32, service: u32) -> Result<()> {
+    ensure!(
+        service != 0 && parent_process(worker)? == service,
+        "输入代理并非由已注册的系统服务启动"
+    );
+    Ok(())
+}
+
+/// Non-elevated clients cannot reliably open another account's primary token.
+/// Instead, bind the worker's image/session/parent to the running LocalSystem
+/// service registered in SCM. Forging this parent requires PROCESS_CREATE_PROCESS
+/// on the SYSTEM service, a right never granted to the interactive user.
+pub(super) fn verify_worker(pipe: HANDLE, session: u32, image: &Path) -> Result<VerifiedWorker> {
+    let mut pid = 0;
+    let mut actual_session = 0;
+    unsafe {
+        GetNamedPipeServerProcessId(pipe, &mut pid).context("从管道读取输入代理进程编号")?;
+        GetNamedPipeServerSessionId(pipe, &mut actual_session).context("从管道读取输入代理会话")?;
+    }
+    ensure!(session == actual_session, "输入服务拒绝跨会话连接");
+    let service = registered_service()?.context("尚未安装 MWB 锁屏输入服务")?;
+    ensure!(
+        same_image(&service.image, image).context("核验输入服务安装路径")?,
+        "当前程序目录与输入服务安装目录不一致；请关闭当前 MWB 后运行：{}",
+        installed_client(&service)?.display()
+    );
+    let service_pid = running_service_pid(service.handle.0)?;
+    let process = Handle(unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+        .context("打开输入代理以核验程序路径")?
+    });
+    ensure!(
+        same_image(
+            &process_image(process.0).context("读取输入代理程序路径")?,
+            image
+        )?,
+        "输入代理程序路径不匹配"
+    );
+    verify_worker_parent(pid, service_pid)?;
+    ensure!(
+        running_service_pid(service.handle.0)? == service_pid,
+        "身份核验期间输入服务发生了重启"
+    );
+    Ok(VerifiedWorker {
+        _process: process,
+        _service: service.handle,
+    })
 }
 
 fn token_data(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<Vec<usize>> {
@@ -178,16 +415,24 @@ pub(super) fn verify_peer(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
             false,
             pid,
-        )?
+        )
+        .context("OpenProcess 打开对端进程进行身份核验")?
     });
     let mut actual_session = 0;
     unsafe {
-        ProcessIdToSessionId(pid, &mut actual_session)?;
+        ProcessIdToSessionId(pid, &mut actual_session).context("读取对端 Windows 会话")?;
     }
     ensure!(actual_session == session, "输入服务拒绝跨会话连接");
-    ensure!(is_system(process.0)? == system, "输入服务进程身份不匹配");
     ensure!(
-        same_image(&process_image(process.0)?, image)?,
+        is_system(process.0).context("核验对端 SYSTEM 账户身份")? == system,
+        "输入服务进程身份不匹配"
+    );
+    ensure!(
+        same_image(
+            &process_image(process.0).context("读取对端可执行文件路径")?,
+            image
+        )
+        .context("核验对端安装路径")?,
         "请使用安装目录中的 MWB 程序连接锁屏输入服务"
     );
     if let Some(user) = user {
@@ -202,6 +447,168 @@ pub(super) fn verify_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_commands_accept_windows_quoting_but_reject_other_entrypoints() {
+        let image = PathBuf::from(r"C:\Program Files\MWB-Rust\mwb-input-service.exe");
+        assert_eq!(
+            service_command_image(r#""C:\Program Files\MWB-Rust\mwb-input-service.exe" --service"#)
+                .unwrap(),
+            image
+        );
+        assert_eq!(
+            service_command_image(r#"C:\MWB\mwb-input-service.exe "--service""#).unwrap(),
+            PathBuf::from(r"C:\MWB\mwb-input-service.exe")
+        );
+        for command in [
+            "",
+            r"C:\MWB\mwb-input-service.exe",
+            r"C:\MWB\mwb-input-service.exe --worker",
+            r"C:\MWB\mwb-input-service.exe --service --worker",
+            r"mwb-input-service.exe --service",
+            r"\MWB\mwb-input-service.exe --service",
+            r"C:MWB\mwb-input-service.exe --service",
+        ] {
+            assert!(service_command_image(command).is_err(), "{command}");
+        }
+    }
+
+    #[test]
+    fn image_paths_accept_aliases_but_reject_a_portable_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = root.path().join("installed");
+        let portable = root.path().join("portable");
+        std::fs::create_dir_all(installed.join("subdirectory")).unwrap();
+        std::fs::create_dir(&portable).unwrap();
+        let image = installed.join(super::super::SERVICE_EXE);
+        std::fs::write(&image, b"identity fixture, never executed").unwrap();
+        let copy = portable.join(super::super::SERVICE_EXE);
+        std::fs::copy(&image, &copy).unwrap();
+        let alias = installed
+            .join("subdirectory")
+            .join("..")
+            .join("MWB-INPUT-SERVICE.EXE");
+        assert!(same_image(&image, &alias).unwrap());
+        let extended = image.canonicalize().unwrap();
+        let command = format!("\"{}\" --service", extended.display());
+        assert!(same_image(&service_command_image(&command).unwrap(), &image).unwrap());
+        assert!(!same_image(&image, &copy).unwrap());
+    }
+
+    fn restricted_logon_identity() -> (Handle, String) {
+        let mut source = HANDLE::default();
+        unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &mut source,
+            )
+            .unwrap();
+        }
+        let source = Handle(source);
+        let logon = logon_sid(source.0).unwrap();
+        let data = token_data(source.0, TokenGroups).unwrap();
+        let groups = unsafe { &*data.as_ptr().cast::<TOKEN_GROUPS>() };
+        let entries = unsafe {
+            std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
+        };
+        let sid = entries
+            .iter()
+            .find(|g| g.Attributes & 0xC0000000 == 0xC0000000)
+            .unwrap()
+            .Sid;
+        let mut restricted = HANDLE::default();
+        let mut identity = HANDLE::default();
+        unsafe {
+            // Restrict the ACL check to this logon SID even when the test runner
+            // is an administrator. No live process/token permissions are changed.
+            CreateRestrictedToken(
+                source.0,
+                DISABLE_MAX_PRIVILEGE,
+                None,
+                None,
+                Some(&[SID_AND_ATTRIBUTES {
+                    Sid: sid,
+                    Attributes: 0,
+                }]),
+                &mut restricted,
+            )
+            .unwrap();
+        }
+        let restricted = Handle(restricted);
+        unsafe {
+            DuplicateTokenEx(
+                restricted.0,
+                TOKEN_QUERY,
+                None,
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut identity,
+            )
+            .unwrap();
+        }
+        (Handle(identity), logon)
+    }
+
+    fn process_access(descriptor: &Descriptor, identity: HANDLE, access: u32) -> bool {
+        let mapping = GENERIC_MAPPING {
+            GenericRead: PROCESS_QUERY_LIMITED_INFORMATION.0 | PROCESS_SYNCHRONIZE.0,
+            GenericWrite: PROCESS_VM_WRITE.0,
+            GenericExecute: PROCESS_SYNCHRONIZE.0,
+            GenericAll: PROCESS_ALL_ACCESS.0,
+        };
+        let mut privileges = [0usize; 64];
+        let mut length = size_of_val(&privileges) as u32;
+        let mut granted = 0;
+        let mut allowed = windows::core::BOOL::default();
+        unsafe {
+            AccessCheck(
+                descriptor.0,
+                identity,
+                access,
+                &mapping,
+                Some(privileges.as_mut_ptr().cast()),
+                &mut length,
+                &mut granted,
+                &mut allowed,
+            )
+            .unwrap();
+        }
+        allowed.as_bool()
+    }
+
+    #[test]
+    fn worker_permissions_allow_identity_queries_but_reject_process_injection_and_parent_spoofing()
+    {
+        let (identity, logon) = restricted_logon_identity();
+        let descriptor = worker_process_descriptor(&logon).unwrap();
+        assert!(process_access(
+            &descriptor,
+            identity.0,
+            PROCESS_QUERY_LIMITED_INFORMATION.0 | PROCESS_SYNCHRONIZE.0
+        ));
+        assert!(!process_access(&descriptor, identity.0, PROCESS_VM_WRITE.0));
+        assert!(!process_access(
+            &descriptor,
+            identity.0,
+            PROCESS_CREATE_PROCESS.0
+        ));
+        let other = worker_process_descriptor("S-1-5-5-0-0").unwrap();
+        assert!(!process_access(
+            &other,
+            identity.0,
+            PROCESS_QUERY_LIMITED_INFORMATION.0
+        ));
+    }
+
+    #[test]
+    fn worker_lineage_uses_the_os_parent_and_rejects_unrelated_service_pids() {
+        let pid = unsafe { GetCurrentProcessId() };
+        let parent = parent_process(pid).unwrap();
+        verify_worker_parent(pid, parent).unwrap();
+        assert!(verify_worker_parent(pid, pid).is_err());
+        assert!(verify_worker_parent(pid, 0).is_err());
+    }
 
     #[test]
     fn peer_identity_binds_process_image_account_and_logon_session() {

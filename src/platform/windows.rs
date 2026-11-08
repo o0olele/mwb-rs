@@ -1,4 +1,7 @@
-use super::{InputInjectionError, InputServiceError};
+use super::{
+    InputInjectionError, InputServiceError,
+    receiver::{Backend, Environment, Receiver},
+};
 use crate::{
     engine::Runtime,
     layout::{DeviceInfo, Point, Rect, Screen},
@@ -444,67 +447,69 @@ fn button_input(button: u8, down: bool) -> Result<()> {
 }
 
 #[derive(Default)]
-pub struct Injector {
-    native: NativeInjector,
-    service: Option<crate::input_service::Client>,
-}
+pub struct Injector(Receiver<NativeInjector, WindowsEnvironment>);
 
 impl Injector {
     pub fn enter_at(&mut self, point: Point, mode: MouseMode) -> Result<()> {
-        self.release_all();
-        self.service = crate::input_service::Client::connect()
-            .map_err(|e| InputServiceError(format!("锁屏输入服务连接失败：{e:#}")))?;
-        if let Some(service) = self.service.as_mut() {
-            service.enter(point, mode)
-        } else {
+        self.0.enter(point, mode)
+    }
+    pub fn apply_event(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
+        self.0.apply(event, keyboard)
+    }
+    pub fn position(&mut self) -> Result<Point> {
+        self.0.position()
+    }
+    pub fn release_all(&mut self) {
+        self.0.release();
+    }
+}
+
+#[derive(Default)]
+struct WindowsEnvironment;
+impl Environment for WindowsEnvironment {
+    type Service = crate::input_service::Client;
+    fn native_available(&mut self) -> Result<bool> {
+        let result = (|| -> Result<bool> {
             let mut active = ::windows::core::BOOL::default();
-            let accessible = unsafe {
-                GetThreadDesktop(GetCurrentThreadId()).is_ok_and(|desktop| {
-                    GetUserObjectInformationW(
-                        ::windows::Win32::Foundation::HANDLE(desktop.0),
-                        UOI_IO,
-                        Some((&mut active as *mut ::windows::core::BOOL).cast()),
-                        size_of::<::windows::core::BOOL>() as u32,
-                        None,
-                    )
-                    .is_ok()
-                        && active.as_bool()
-                })
-            };
-            if !accessible {
-                return Err(InputServiceError(
+            unsafe {
+                let desktop = GetThreadDesktop(GetCurrentThreadId())?;
+                GetUserObjectInformationW(
+                    ::windows::Win32::Foundation::HANDLE(desktop.0),
+                    UOI_IO,
+                    Some((&mut active as *mut ::windows::core::BOOL).cast()),
+                    size_of::<::windows::core::BOOL>() as u32,
+                    None,
+                )?;
+            }
+            Ok(active.as_bool())
+        })();
+        result.map_err(|e| InputServiceError(format!("检查当前输入桌面失败：{e:#}")).into())
+    }
+    fn connect_service(&mut self) -> Result<Self::Service> {
+        crate::input_service::Client::connect()
+            .map_err(|e| InputServiceError(format!("锁屏输入服务连接失败：{e:#}")))?
+            .ok_or_else(|| {
+                InputServiceError(
                     "当前桌面不可访问；锁屏控制需要在被控端安装输入服务，并运行安装目录中的 MWB"
                         .into(),
                 )
-                .into());
-            }
-            self.native.enter_at(point, mode)
-        }
-    }
-    pub fn apply_event(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
-        if let Some(service) = self.service.as_mut() {
-            service.apply(event, keyboard)
-        } else {
-            self.native.apply_event(event, keyboard)
-        }
-    }
-    pub fn position(&mut self) -> Result<Point> {
-        if let Some(service) = self.service.as_mut() {
-            service.position()
-        } else {
-            cursor_position()
-        }
-    }
-    pub fn release_all(&mut self) {
-        if let Some(mut service) = self.service.take() {
-            service.release();
-        }
-        self.native.release_all();
+                .into()
+            })
     }
 }
-impl Drop for Injector {
-    fn drop(&mut self) {
-        self.release_all();
+
+impl Backend for crate::input_service::Client {
+    fn enter(&mut self, point: Point, mode: MouseMode) -> Result<()> {
+        Self::enter(self, point, mode)
+    }
+    fn apply(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
+        Self::apply(self, event, keyboard)
+    }
+    fn position(&mut self) -> Result<Point> {
+        Self::position(self)
+    }
+    fn release(&mut self) {
+        Self::release(self);
     }
 }
 
@@ -597,6 +602,21 @@ impl NativeInjector {
 
 impl Drop for NativeInjector {
     fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
+impl Backend for NativeInjector {
+    fn enter(&mut self, point: Point, mode: MouseMode) -> Result<()> {
+        self.enter_at(point, mode)
+    }
+    fn apply(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
+        self.apply_event(event, keyboard)
+    }
+    fn position(&mut self) -> Result<Point> {
+        cursor_position()
+    }
+    fn release(&mut self) {
         self.release_all();
     }
 }

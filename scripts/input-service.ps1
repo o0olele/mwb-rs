@@ -1,9 +1,9 @@
-#Requires -RunAsAdministrator
-[CmdletBinding()]
+#Requires -Version 5.1
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [ValidateSet('Install', 'Uninstall')]
     [string]$Action = 'Install',
-    [string]$BuildDirectory = (Join-Path $PSScriptRoot '..\target\release')
+    [string]$BuildDirectory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,12 +36,15 @@ if (Test-Path -LiteralPath $installDirectory) {
     }
 }
 
-$existing = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
-if ($existing -and $existing.PathName -ne $expectedCommand) {
-    throw 'A different service already uses this name. Its configuration was not changed.'
-}
-
 if ($Action -eq 'Install') {
+    # Windows PowerShell 5.1 does not populate PSScriptRoot while evaluating
+    # advanced-script parameter defaults. Resolve it only after binding.
+    if ([string]::IsNullOrWhiteSpace($BuildDirectory)) {
+        if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+            throw 'Cannot locate the script directory. Run with -File or specify -BuildDirectory.'
+        }
+        $BuildDirectory = Join-Path -Path $PSScriptRoot -ChildPath '..\target\release'
+    }
     $resolvedBuild = (Resolve-Path -LiteralPath $BuildDirectory).Path
     foreach ($name in @('mwb.exe', 'mwb-input-service.exe')) {
         $source = Join-Path $resolvedBuild $name
@@ -52,6 +55,28 @@ if ($Action -eq 'Install') {
             throw 'BuildDirectory must differ from the installation directory.'
         }
     }
+}
+
+# A single gate also covers native sc.exe and all file/service mutations.
+# -WhatIf validates the package and its paths without changing the machine.
+$operation = if ($Action -eq 'Install') {
+    "Install the MWB input service from '$resolvedBuild'"
+} else {
+    'Uninstall the MWB input service'
+}
+if (-not $PSCmdlet.ShouldProcess($installDirectory, $operation)) { return }
+
+$installerIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+try {
+    $installerPrincipal = [Security.Principal.WindowsPrincipal]::new($installerIdentity)
+    if (-not $installerPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Install and Uninstall require an administrator PowerShell window. Use -WhatIf to preview without elevation.'
+    }
+} finally { $installerIdentity.Dispose() }
+
+$existing = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
+if ($existing -and $existing.PathName -ne $expectedCommand) {
+    throw 'A different service already uses this name. Its configuration was not changed.'
 }
 
 $runningApp = Get-CimInstance Win32_Process -Filter "Name='mwb.exe'" |

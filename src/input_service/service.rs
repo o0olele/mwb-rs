@@ -1,7 +1,7 @@
 use super::{
     CLIENT_EXE, SERVICE_NAME,
     desktop::DesktopInput,
-    identity::{self, Descriptor, Handle},
+    identity::{self, Handle},
     pipe::{self, LEASE, Pipe},
     pipe_name,
     session::Session,
@@ -217,20 +217,15 @@ impl Worker {
             )?;
         }
         let source = Handle(source);
-        // The interactive client must be able to authenticate this SYSTEM
-        // agent. Grant only token-query / process-query-and-wait rights, never
-        // duplication, memory access, thread creation or token adjustment.
-        let token_sd =
-            Descriptor::new(&format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0008;;;{user})"))?;
-        let process_sd = Descriptor::new(&format!(
-            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00101000;;;{user})"
-        ))?;
+        // Clients query only the worker's image/session and SCM-owned parent.
+        // Its SYSTEM token keeps the default SYSTEM/administrator permissions.
+        let process_sd = identity::worker_process_descriptor(&user)?;
         let mut token = HANDLE::default();
         unsafe {
             DuplicateTokenEx(
                 source.0,
                 TOKEN_ALL_ACCESS,
-                Some(&token_sd.attributes()),
+                None,
                 SecurityImpersonation,
                 TokenPrimary,
                 &mut token,
@@ -365,6 +360,7 @@ fn worker(session: u32, parent: u32, stop_name: &str) -> Result<()> {
         )?
     });
     let user = identity::session_user(session)?;
+    identity::allow_worker_verification(&user)?;
     let pipe = Pipe::create(&pipe_name(session), &user)?;
     let stopping = || unsafe {
         WaitForSingleObject(stop.0, 0) != WAIT_TIMEOUT

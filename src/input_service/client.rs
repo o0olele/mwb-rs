@@ -1,6 +1,6 @@
 use super::{
     SERVICE_EXE,
-    identity::{self, Handle},
+    identity::{self, VerifiedWorker},
     pipe::{Pipe, TIMEOUT},
     pipe_name,
     wire::{Command, Reply, Request, Response, VERSION},
@@ -11,34 +11,30 @@ use crate::{
     protocol::{InputEvent, MouseMode},
 };
 use anyhow::{Context, Result, ensure};
-use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
 
 pub(crate) struct Client {
     pipe: Pipe,
-    _server: Handle,
+    _server: VerifiedWorker,
     sequence: u64,
     failed: bool,
 }
 
 impl Client {
     pub fn connect() -> Result<Option<Self>> {
-        let session = identity::current_session()?;
-        let Some(pipe) = Pipe::open(&pipe_name(session))? else {
+        let session = identity::current_session().context("读取当前 Windows 会话")?;
+        let Some(pipe) = Pipe::open(&pipe_name(session)).context("打开输入服务管道")?
+        else {
             return Ok(None);
         };
-        let mut pid = 0;
-        unsafe {
-            GetNamedPipeServerProcessId(pipe.handle.0, &mut pid)?;
-        }
         let server =
-            identity::verify_peer(pid, session, &identity::sibling(SERVICE_EXE)?, true, None)?;
+            identity::verify_worker(pipe.handle.0, session, &identity::sibling(SERVICE_EXE)?)?;
         let mut client = Self {
             pipe,
             _server: server,
             sequence: 0,
             failed: false,
         };
-        client.ok(Command::Hello)?;
+        client.ok(Command::Hello).context("与输入服务握手")?;
         Ok(Some(client))
     }
 
