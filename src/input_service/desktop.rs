@@ -11,18 +11,67 @@ use std::{
     time::{Duration, Instant},
 };
 use windows::Win32::{
-    Foundation::{HANDLE, LPARAM, LRESULT, WPARAM},
+    Foundation::{HANDLE, LPARAM, LRESULT, NTSTATUS, WPARAM},
     System::{
-        LibraryLoader::GetModuleHandleW,
+        LibraryLoader::{GetModuleHandleW, GetProcAddress},
         RemoteDesktop::WTSGetActiveConsoleSessionId,
         StationsAndDesktops::*,
         Threading::{GetCurrentProcess, GetCurrentThreadId},
+        WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION,
     },
     UI::WindowsAndMessaging::*,
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static TAKEOVER: AtomicBool = AtomicBool::new(false);
+
+const INPUT_DESKTOP_ACCESS: DESKTOP_ACCESS_FLAGS = DESKTOP_ACCESS_FLAGS(
+    DESKTOP_READOBJECTS.0
+        | DESKTOP_WRITEOBJECTS.0
+        | DESKTOP_HOOKCONTROL.0
+        // SendInput checks this right on the thread's attached desktop handle,
+        // independently of SYSTEM identity, integrity level and UIAccess.
+        | DESKTOP_JOURNALPLAYBACK.0
+        | DESKTOP_SWITCHDESKTOP.0,
+);
+
+/// Query rights granted to this handle, independently of the desktop ACL and
+/// process token. Dynamically load the documented NtQueryObject entry point.
+fn object_access(object: HANDLE) -> Result<u32> {
+    type QueryObject =
+        unsafe extern "system" fn(HANDLE, u32, *mut std::ffi::c_void, u32, *mut u32) -> NTSTATUS;
+    let module = unsafe { GetModuleHandleW(windows::core::w!("ntdll.dll"))? };
+    let address = unsafe { GetProcAddress(module, windows::core::s!("NtQueryObject")) }
+        .context("NtQueryObject 不可用，无法核验桌面句柄权限")?;
+    let query: QueryObject = unsafe { std::mem::transmute(address) };
+    let mut info = PUBLIC_OBJECT_BASIC_INFORMATION::default();
+    let mut length = 0;
+    let status = unsafe {
+        query(
+            object,
+            0,
+            (&mut info as *mut PUBLIC_OBJECT_BASIC_INFORMATION).cast(),
+            size_of::<PUBLIC_OBJECT_BASIC_INFORMATION>() as u32,
+            &mut length,
+        )
+    };
+    ensure!(
+        status.0 >= 0,
+        "读取对象句柄权限失败：NTSTATUS 0x{:08x}",
+        status.0 as u32
+    );
+    Ok(info.GrantedAccess)
+}
+
+fn require_input_access(desktop: HDESK) -> Result<()> {
+    let granted = object_access(HANDLE(desktop.0))?;
+    ensure!(
+        granted & INPUT_DESKTOP_ACCESS.0 == INPUT_DESKTOP_ACCESS.0,
+        "输入桌面句柄权限不足：granted=0x{granted:x}，required=0x{:x}；SendInput 需要 DESKTOP_JOURNALPLAYBACK (0x20)",
+        INPUT_DESKTOP_ACCESS.0
+    );
+    Ok(())
+}
 
 fn object_name(object: HANDLE) -> Result<String> {
     let mut needed = 0;
@@ -65,10 +114,15 @@ pub(super) fn diagnostics() -> String {
             info.session, info.system, info.integrity, info.ui_access
         ))
     })();
-    let station =
-        (|| -> Result<String> { object_name(HANDLE(unsafe { GetProcessWindowStation()? }.0)) })();
+    let station = (|| -> Result<String> {
+        let station = HANDLE(unsafe { GetProcessWindowStation()? }.0);
+        let access = value_or_error(object_access(station).map(|access| format!("0x{access:x}")));
+        Ok(format!("{},stationAccess={access}", object_name(station)?))
+    })();
     let current = (|| -> Result<String> {
-        object_name(HANDLE(unsafe { GetThreadDesktop(GetCurrentThreadId())? }.0))
+        let desktop = HANDLE(unsafe { GetThreadDesktop(GetCurrentThreadId())? }.0);
+        let access = value_or_error(object_access(desktop).map(|access| format!("0x{access:x}")));
+        Ok(format!("{},desktopAccess={access}", object_name(desktop)?))
     })();
     let input = (|| -> Result<String> {
         let desktop =
@@ -165,16 +219,11 @@ impl DesktopInput {
 
     fn attach(&mut self) -> Result<()> {
         unsafe {
-            let next = OpenInputDesktop(
-                DESKTOP_CONTROL_FLAGS(0),
-                false,
-                DESKTOP_ACCESS_FLAGS(
-                    DESKTOP_READOBJECTS.0
-                        | DESKTOP_WRITEOBJECTS.0
-                        | DESKTOP_HOOKCONTROL.0
-                        | DESKTOP_SWITCHDESKTOP.0,
-                ),
-            )?;
+            let next = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, INPUT_DESKTOP_ACCESS)?;
+            if let Err(error) = require_input_access(next) {
+                let _ = CloseDesktop(next);
+                return Err(error);
+            }
             if let Err(error) = SetThreadDesktop(next) {
                 let _ = CloseDesktop(next);
                 return Err(error.into());
@@ -265,6 +314,110 @@ impl Drop for DesktopInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::{
+        Foundation::{ERROR_SUCCESS, GetLastError, SetLastError},
+        UI::Input::KeyboardAndMouse::*,
+    };
+
+    struct Desktop(HDESK);
+    impl Drop for Desktop {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseDesktop(self.0);
+            }
+        }
+    }
+
+    fn old_access() -> DESKTOP_ACCESS_FLAGS {
+        DESKTOP_ACCESS_FLAGS(INPUT_DESKTOP_ACCESS.0 & !DESKTOP_JOURNALPLAYBACK.0)
+    }
+
+    #[test]
+    fn granted_desktop_rights_reject_the_old_mask_before_input() {
+        let current = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.unwrap();
+        let name = pipe::wide(&object_name(HANDLE(current.0)).unwrap());
+        for (access, accepted) in [(old_access(), false), (INPUT_DESKTOP_ACCESS, true)] {
+            let desktop = Desktop(
+                unsafe {
+                    OpenDesktopW(
+                        windows::core::PCWSTR(name.as_ptr()),
+                        DESKTOP_CONTROL_FLAGS(0),
+                        false,
+                        access.0,
+                    )
+                }
+                .unwrap(),
+            );
+            let granted = object_access(HANDLE(desktop.0.0)).unwrap();
+            assert_eq!(granted & DESKTOP_JOURNALPLAYBACK.0 != 0, accepted);
+            let checked = require_input_access(desktop.0);
+            assert_eq!(checked.is_ok(), accepted);
+            if !accepted {
+                assert!(
+                    checked
+                        .unwrap_err()
+                        .to_string()
+                        .contains("DESKTOP_JOURNALPLAYBACK")
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an unlocked interactive desktop; creates a hidden test desktop and injects only zero-distance mouse moves"]
+    fn attached_desktop_access_controls_send_input() {
+        for (access, expected, rebind) in [
+            (INPUT_DESKTOP_ACCESS, 1, false),
+            (old_access(), 0, true),
+            (INPUT_DESKTOP_ACCESS, 1, true),
+        ] {
+            std::thread::spawn(move || unsafe {
+                let original = GetThreadDesktop(GetCurrentThreadId()).unwrap();
+                let desktop = Desktop(OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, access).unwrap());
+                let name = object_name(HANDLE(desktop.0.0)).unwrap();
+                assert!(name.eq_ignore_ascii_case("Default"), "test requires Default, got {name}");
+                // Attach through a distinct, never-displayed desktop, avoiding
+                // cached access from a prior connection to the same desktop.
+                let temporary_name = pipe::wide(&format!("MWB.Input.Test.{}", GetCurrentThreadId()));
+                let temporary = rebind.then(|| Desktop(CreateDesktopW(windows::core::PCWSTR(temporary_name.as_ptr()), None,
+                    None, DESKTOP_CONTROL_FLAGS(0), INPUT_DESKTOP_ACCESS.0
+                        | DESKTOP_CREATEWINDOW.0 | DESKTOP_CREATEMENU.0, None).unwrap()));
+                struct Reset(HDESK);
+                impl Drop for Reset {
+                    fn drop(&mut self) { unsafe { let _ = SetThreadDesktop(self.0); } }
+                }
+                let reset = Reset(original);
+                if let Some(temporary) = &temporary {
+                    SetThreadDesktop(temporary.0).unwrap();
+                }
+                SetThreadDesktop(desktop.0).unwrap();
+                let granted = object_access(HANDLE(GetThreadDesktop(GetCurrentThreadId()).unwrap().0)).unwrap();
+                let input = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dwFlags: MOUSEEVENTF_MOVE,
+                            dwExtraInfo: 0x4D574252,
+                            ..Default::default()
+                        },
+                    },
+                };
+                SetLastError(ERROR_SUCCESS);
+                let inserted = SendInput(&[input], size_of::<INPUT>() as i32);
+                let code = GetLastError().0;
+                eprintln!(
+                    "desktop={name},rebind={rebind},requested=0x{:x},granted=0x{granted:x},inserted={inserted},error={code}", access.0
+                );
+                drop(reset);
+                drop(temporary);
+                drop(desktop);
+                assert_eq!(inserted, expected, "access=0x{:x}, error={code}", access.0);
+                if expected == 0 {
+                    assert_eq!(code, 5);
+                }
+            }).join().unwrap();
+        }
+    }
 
     #[test]
     fn diagnostic_snapshot_reads_context_without_creating_an_input_backend() {
@@ -279,5 +432,7 @@ mod tests {
         assert!(snapshot.contains("uiAccess="));
         assert!(snapshot.contains("station="));
         assert!(snapshot.contains("inputDesktop="));
+        assert!(snapshot.contains("desktopAccess=0x"));
+        assert!(snapshot.contains("stationAccess=0x"));
     }
 }

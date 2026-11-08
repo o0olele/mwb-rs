@@ -2,6 +2,14 @@
 
 本实现针对“控制端保持解锁，被控端已运行 MWB 并连接工作组，随后锁屏”的场景。安装可选服务后，接收端输入由登录会话中的 LocalSystem 代理执行。服务仅接收键鼠命令；网络认证、工作组、剪贴板和文件传输继续由普通用户主程序负责。
 
+v0.5.5 根据用户提供的 v0.5.4 失败日志继续定位：代理与物理控制台会话均为 15，SYSTEM 身份、系统完整性级别、UIAccess、`WinSta0` 及 `Winlogon` 线程/输入桌面都匹配，首次定位仍返回 0/5。这说明该次失败没有缺少前述令牌和桌面条件；此前没有检查**桌面句柄本身的实际访问权限**。
+
+打开输入桌面时原先请求的掩码为 `0x189`，漏了 `DESKTOP_JOURNALPLAYBACK (0x20)`。本版请求 `0x1a9`，并在调用 `SetThreadDesktop` 前通过动态加载的 `NtQueryObject(ObjectBasicInformation)` 核验 `GrantedAccess`。访问位不足会给出具体的 required/granted 错误，权限查询失败也不会被当作注入成功。日志新增 `desktopAccess` 和 `stationAccess`，记录线程桌面及窗口站句柄实际授予的权限。此处使用的是桌面访问位，不安装 journal 钩子。[桌面访问权限](https://learn.microsoft.com/en-us/windows/win32/winstation/desktop-security-and-access-rights)、[NtQueryObject 的 GrantedAccess](https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntqueryobject)。原 MSDN 作者也记录过同类 LocalSystem/Winlogon 注入失败及补齐该访问位的处理，见 [原文归档镜像](https://www.sysadmins.lv/retired-msft-blogs/alejacma/sendinput-doesnt-work-but-it-doesnt-return-an-error.aspx)。
+
+已在普通 `Default` 桌面用零位移真实注入验证：旧掩码实际授予 `0x189`，返回 0、错误码 5；新掩码实际授予 `0x1a9`，返回 1、错误码 0。直接附加及经过另一不可见测试桌面重新附加两种路径都验证成功。测试不改变可见桌面，不输入按键，隐藏测试桌面结束后释放；尚未在被控端输入真实 PIN。
+
+本版本地输入服务协议为 **3**，拒绝仍使用旧掩码的服务；设备间网络协议仍为 5。
+
 v0.5.4 针对用户在 **Windows 11 25H2** 复测 v0.5.3 时，代理首次定位仍收到 `SendInput 返回 0/1，Win32 错误码 5` 的反馈，补齐以下权限与诊断处理；当前尚未获得本版 PIN 输入成功的实机结果。
 
 - UIAccess 是与 SYSTEM 身份、令牌完整性级别分别查询的属性。服务使用已启用的 `SeTcbPrivilege`，在**新复制的主令牌**上通过 32 位值设置 `TokenUIAccess`，读取核验后才创建代理；代理进程启动后再检查 SYSTEM、会话、完整性级别和 UIAccess。原版 Winlogon 源令牌不被修改。该属性的用途及系统注入限制见 [UI 自动化安全说明](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-securityoverview)、[令牌信息类型](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_information_class)。这修正了代码未显式配置 UIAccess 的缺口，但仅凭错误码 5 仍不能认定它就是该机器上的唯一原因。
@@ -49,15 +57,15 @@ $probe.ExitCode
 
 诊断命令：`Get-Service MwbRustInput`。代理启动或通信错误记录在安装目录的 `input-service.log`，最大约 1 MiB；不记录键值、密码、配对密钥或剪贴板内容。若在锁屏状态遇到服务故障，先用被控端本地键鼠解锁，修复服务后重新开启共享。
 
-若连接记录提示“请使用安装目录中的 MWB 程序”或安装目录不一致，关闭当前主程序，再打开已安装的 `mwb.exe` 并重新连接。更新 v0.5.4 时必须重新执行安装脚本，更换**主程序和输入服务**；只运行开发目录的新 exe 或只替换主程序不会更新服务启动路径。若仍遇到 `SendInput 返回 0/1`，记录完整错误链及服务日志：错误中的“会话输入代理在当前桌面定位/注入失败”表示已到达服务输入阶段；“普通桌面定位/输入未插入事件”表示普通输入被拒绝后迁移服务也失败。错误码 0 仅表示系统没有提供更多信息，不能据此判断注入成功或确定是 UIPI。[SendInput 返回值与限制](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)。输入失败会暂停共享，需先在本地解锁、修复并恢复共享。
+若连接记录提示“请使用安装目录中的 MWB 程序”或安装目录不一致，关闭当前主程序，再打开已安装的 `mwb.exe` 并重新连接。更新 v0.5.5 时必须重新执行安装脚本，更换**主程序和输入服务**；只运行开发目录的新 exe 或只替换主程序不会更新服务启动路径。若仍遇到 `SendInput 返回 0/1`，记录完整错误链及服务日志：错误中的“会话输入代理在当前桌面定位/注入失败”表示已到达服务输入阶段；“普通桌面定位/输入未插入事件”表示普通输入被拒绝后迁移服务也失败。错误码 0 仅表示系统没有提供更多信息，不能据此判断注入成功或确定是 UIPI。[SendInput 返回值与限制](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)。输入失败会暂停共享，需先在本地解锁、修复并恢复共享。
 
-v0.5.4 复现失败后，可在被控端解锁并读取最后的诊断记录：
+复现失败后，可在被控端解锁并读取最后的诊断记录：
 
 ```powershell
 Get-Content -LiteralPath (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'MWB-Rust\input-service.log') -Tail 20
 ```
 
-代理启动记录应包含 `agent=0.5.4`、`system=true`、`integrity=0x4000`（或更高）、`uiAccess=true`；令牌会话号应与控制台一致。失败记录同时带有 `threadDesktop` 和 `inputDesktop`，用于确认发起注入的线程是否处在当时的输入桌面。启动时尚未锁屏，输入桌面显示 `Default` 是正常的，应以失败时的快照为准。日志不记录键值、鼠标位置、PIN 或配对密钥。
+代理启动记录应包含 `agent=0.5.5`、`system=true`、`integrity=0x4000`（或更高）、`uiAccess=true`；令牌会话号应与控制台一致。失败记录同时带有 `threadDesktop`、`inputDesktop`、`desktopAccess` 和 `stationAccess`。附加后 `desktopAccess` 应包含 `0x1a9` 的全部访问位；若为 `0x189`，仍缺少本次修正的 `0x20`。启动时尚未锁屏，输入桌面显示 `Default` 是正常的，应以失败时的快照为准。日志不记录键值、鼠标位置、PIN 或配对密钥。
 
 ## 输入与故障处理
 
@@ -87,6 +95,14 @@ Get-Content -LiteralPath (Join-Path ([Environment]::GetFolderPath('ProgramFiles'
 v0.5.3 新增回归覆盖活动桌面拒绝输入（错误码 0/5）后的迁移、首次定位竞争、持续切换时重试上限、未知/非零插入结果不重放，以及成功解锁按键后立即切换桌面不重复输入。令牌复制和 Winlogon 桌面启动需在安装后的 LocalSystem 服务中实测，单元测试不能代替这部分验收。
 
 v0.5.4 新增真实进程令牌/桌面属性的只读查询测试，以及代理权限组合、旧服务/旧客户端协议拒绝测试；自动测试不设置真实进程的 UIAccess、不安装代理服务、不触发锁屏或注入 PIN。服务启动时的权限配置和最终 PIN 登录效果仍需部署后确认。
+
+v0.5.5 常规测试新增实际桌面句柄权限查询和旧掩码拒绝检查。另有默认跳过的真实零位移对照测试，本轮已单独运行通过：
+
+```powershell
+cargo test --no-default-features --lib --locked attached_desktop_access_controls_send_input -- --ignored --nocapture
+```
+
+该测试仅在已解锁交互桌面运行；创建不可见测试桌面以隔离缓存的附加权限，直接/重新附加时以新掩码成功注入零位移，旧掩码稳定返回 0/5。它不等同于真实 Winlogon/PIN 验收。
 
 **尚未完成两台实体电脑的锁屏登录验收。** 部署后需分别验证：被控端先锁屏再切入；远控过程中锁屏；密码/PIN 解锁后继续移动；两种鼠标模式；本地键鼠接管；按住按键时退出主程序或停止服务；卸载后普通桌面控制。测试结束确认没有按键或鼠标按钮残留。
 

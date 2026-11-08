@@ -5,10 +5,10 @@ use crate::{
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-// Version 2 requires a worker whose UIAccess token was verified before launch.
+// Version 3 additionally requires a desktop handle with SendInput access.
 // Keep the well-known pipe name stable so an old installation gets a clear
 // version-mismatch error instead of appearing to be absent.
-pub(super) const VERSION: u32 = 2;
+pub(super) const VERSION: u32 = 3;
 pub(super) const MAX_MESSAGE: usize = 4096;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,10 +77,16 @@ mod tests {
 
     #[test]
     fn old_worker_is_rejected_with_upgrade_guidance_before_any_input() {
-        let legacy: Response = decode(br#"{"version":1,"sequence":1,"result":"Ok"}"#).unwrap();
-        let error = legacy.validate(1).unwrap_err().to_string();
-        assert!(error.contains("重新安装"));
-        assert!(error.contains("服务 IPC 1"));
+        for version in [1, 2] {
+            let legacy = Response {
+                version,
+                sequence: 1,
+                result: Reply::Ok,
+            };
+            let error = legacy.validate(1).unwrap_err().to_string();
+            assert!(error.contains("重新安装"));
+            assert!(error.contains(&format!("服务 IPC {version}")));
+        }
         let current = Response {
             version: VERSION,
             sequence: 1,
