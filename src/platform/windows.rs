@@ -27,7 +27,7 @@ use std::{
     mem::size_of,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread,
@@ -36,9 +36,6 @@ use std::{
 const MARKER: usize = 0x4D574252;
 static RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
 static HOOKS_READY: AtomicBool = AtomicBool::new(false);
-// Suppressed keystrokes do not update GetAsyncKeyState. Track physical modifiers
-// here so the emergency chord also works while keyboard forwarding is active.
-static MODIFIERS: AtomicU8 = AtomicU8::new(0);
 thread_local! {
     static LAST_DIRECTION: Cell<Point> = const { Cell::new(Point { x: 1.0, y: 0.0 }) };
 }
@@ -64,6 +61,15 @@ pub fn install_hooks(runtime: Arc<Runtime>) -> Result<()> {
         })();
         match result {
             Ok((mouse, keyboard)) => {
+                if let Some(rt) = RUNTIME.get() {
+                    rt.switch_gate.clear_keys();
+                    // Capture keys already held when hooks are installed. Later
+                    // suppressed events are tracked directly, not via async state.
+                    for vk in [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5] {
+                        rt.switch_gate
+                            .observe_key(vk, GetAsyncKeyState(vk as i32) < 0);
+                    }
+                }
                 HOOKS_READY.store(true, Ordering::SeqCst);
                 let _ = tx.send(Ok(()));
                 let mut msg = MSG::default();
@@ -75,6 +81,7 @@ pub fn install_hooks(runtime: Arc<Runtime>) -> Result<()> {
                 let _ = UnhookWindowsHookEx(keyboard);
                 HOOKS_READY.store(false, Ordering::SeqCst);
                 if let Some(rt) = RUNTIME.get() {
+                    rt.switch_gate.clear_keys();
                     rt.reclaim();
                 }
             }
@@ -325,23 +332,12 @@ unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
             return CallNextHookEx(None, code, wp, lp);
         };
         let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-        let modifier = match event.vkCode {
-            0x11 | 0xA2 => 1,
-            0xA3 => 2,
-            0x12 | 0xA4 => 4,
-            0xA5 => 8,
-            _ => 0,
-        };
-        if down {
-            MODIFIERS.fetch_or(modifier, Ordering::Relaxed);
-        } else {
-            MODIFIERS.fetch_and(!modifier, Ordering::Relaxed);
-        }
-        let modifiers = MODIFIERS.load(Ordering::Relaxed);
+        let modifier = rt.switch_gate.observe_key(event.vkCode as u16, down);
+        let (ctrl, alt) = rt.switch_gate.ctrl_alt_down();
         if event.vkCode == VK_HOME.0 as u32
             && down
-            && (modifiers & 3 != 0 || GetAsyncKeyState(VK_CONTROL.0 as i32) < 0)
-            && (modifiers & 12 != 0 || GetAsyncKeyState(VK_MENU.0 as i32) < 0)
+            && (ctrl || GetAsyncKeyState(VK_CONTROL.0 as i32) < 0)
+            && (alt || GetAsyncKeyState(VK_MENU.0 as i32) < 0)
         {
             rt.reclaim();
             return LRESULT(1);
@@ -362,7 +358,11 @@ unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                 down,
             })
         {
-            return LRESULT(1);
+            // A modifier may have gone down locally before crossing the edge.
+            // Forward its release, but also let Windows release the local key.
+            if down || !modifier {
+                return LRESULT(1);
+            }
         }
         CallNextHookEx(None, code, wp, lp)
     }

@@ -210,6 +210,14 @@ impl Layout {
         result.validate()?;
         Ok(result)
     }
+    pub fn without_offline(&self, id: &str) -> Result<Self> {
+        let device = self.get(id).ok_or_else(|| anyhow::anyhow!("设备不存在"))?;
+        ensure!(!device.online, "设备已在线，请先在该设备停止连接");
+        let mut result = self.clone();
+        result.devices.retain(|d| d.info.id != id);
+        result.validate()?;
+        Ok(result)
+    }
     pub fn upsert(&mut self, info: DeviceInfo, online: bool) -> Result<()> {
         info.validate()?;
         let mut next = self.clone();
@@ -395,6 +403,23 @@ mod tests {
                 },
             ],
         }
+    }
+    #[test]
+    fn removing_an_offline_device_frees_capacity_and_preserves_other_positions() {
+        let mut l = Layout::default();
+        for id in 1..=MAX_DEVICES as u8 {
+            l.upsert(test_device(id, 1920, 1080), id == 1).unwrap();
+        }
+        let extra = test_device(17, 1920, 1080);
+        assert!(l.upsert(extra.clone(), true).is_err());
+        let original = l.clone();
+        assert!(l.without_offline(&l.devices[0].info.id).is_err());
+        let removed = l.devices[1].info.id.clone();
+        l = l.without_offline(&removed).unwrap();
+        assert_eq!(l.devices[1..], original.devices[2..]);
+        l.upsert(extra, true).unwrap();
+        assert_eq!(l.devices.len(), MAX_DEVICES);
+        l.validate().unwrap();
     }
     #[test]
     fn arbitrary_offset_and_vertical_gaps_route_to_actual_intersections() {

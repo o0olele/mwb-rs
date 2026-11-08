@@ -22,6 +22,10 @@ impl InputInjectionError {
             code,
         }
     }
+
+    pub(crate) fn nothing_inserted(&self) -> bool {
+        self.inserted == 0
+    }
 }
 
 impl fmt::Display for InputInjectionError {

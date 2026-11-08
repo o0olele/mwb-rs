@@ -1,6 +1,7 @@
 use super::wire::{Command, Reply, Request, VERSION};
 use crate::{
     layout::Point,
+    platform::InputInjectionError,
     protocol::{InputEvent, MouseMode},
 };
 use anyhow::{Result, ensure};
@@ -9,9 +10,10 @@ pub(super) trait Backend {
     /// Return true after moving to a different input desktop. Release all held
     /// input on the previous desktop before detaching from it.
     fn refresh_desktop(&mut self) -> Result<bool>;
+    /// A failed positioning injection must preserve its InputInjectionError.
     fn enter(&mut self, point: Point, mode: MouseMode) -> Result<()>;
-    // Err must mean the single input event was not inserted. This permits one
-    // retry only if a desktop switch raced the initial readiness check.
+    // Preserve InputInjectionError so only a confirmed zero-insertion failure
+    // can be retried when a desktop switch races the initial readiness check.
     fn apply(&mut self, event: InputEvent, keyboard: bool) -> Result<()>;
     fn position(&mut self) -> Result<Point>;
     fn release(&mut self);
@@ -73,7 +75,7 @@ impl<B: Backend> Session<B> {
                 );
                 self.release();
                 self.backend.refresh_desktop()?;
-                self.backend.enter(point, mode)?;
+                self.enter_current_desktop(point, mode)?;
                 self.mode = Some(mode);
                 self.point = point;
                 self.taken_over = false;
@@ -85,7 +87,7 @@ impl<B: Backend> Session<B> {
                 }
                 self.refresh()?;
                 if let Err(error) = self.backend.apply(event.clone(), keyboard) {
-                    if !self.refresh()? {
+                    if !nothing_inserted(&error) || !self.refresh()? {
                         return Err(error);
                     }
                     self.backend.apply(event.clone(), keyboard)?;
@@ -120,6 +122,18 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    fn enter_current_desktop(&mut self, point: Point, mode: MouseMode) -> Result<()> {
+        if let Err(error) = self.backend.enter(point, mode) {
+            // Enter also injects a mouse event. Lock/unlock can race this first
+            // positioning call just as it can race a later key or mouse event.
+            if !nothing_inserted(&error) || !self.backend.refresh_desktop()? {
+                return Err(error);
+            }
+            self.backend.enter(point, mode)?;
+        }
+        Ok(())
+    }
+
     fn refresh(&mut self) -> Result<bool> {
         let mode = self
             .mode
@@ -128,7 +142,7 @@ impl<B: Backend> Session<B> {
         if changed {
             // The old desktop's key/button state is never replayed onto a login
             // screen. Preserve only mouse mode/position for continuous control.
-            self.backend.enter(self.point, mode)?;
+            self.enter_current_desktop(self.point, mode)?;
         }
         Ok(changed)
     }
@@ -137,6 +151,12 @@ impl<B: Backend> Session<B> {
         self.mode = None;
         self.backend.release();
     }
+}
+
+fn nothing_inserted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<InputInjectionError>()
+        .is_some_and(InputInjectionError::nothing_inserted)
 }
 
 impl<B: Backend> Drop for Session<B> {
@@ -148,16 +168,23 @@ impl<B: Backend> Drop for Session<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     #[derive(Default)]
     struct Fake {
         changed: bool,
-        switch_on_apply: bool,
+        enter_failures: VecDeque<(bool, anyhow::Error)>,
+        apply_failures: VecDeque<(bool, anyhow::Error)>,
         switch_on_position: bool,
+        switch_after_apply: bool,
+        enter_attempts: usize,
+        apply_attempts: usize,
         applies: usize,
         takeover: bool,
         enters: usize,
@@ -174,15 +201,22 @@ mod tests {
             Ok(changed)
         }
         fn enter(&mut self, _: Point, mode: MouseMode) -> Result<()> {
+            self.enter_attempts += 1;
+            if let Some((changed, error)) = self.enter_failures.pop_front() {
+                self.changed |= changed;
+                return Err(error);
+            }
             self.enters += 1;
             self.mode = Some(mode);
             Ok(())
         }
         fn apply(&mut self, event: InputEvent, _: bool) -> Result<()> {
-            if std::mem::take(&mut self.switch_on_apply) {
-                self.changed = true;
-                anyhow::bail!("desktop changed before SendInput");
+            self.apply_attempts += 1;
+            if let Some((changed, error)) = self.apply_failures.pop_front() {
+                self.changed |= changed;
+                return Err(error);
             }
+            self.changed |= std::mem::take(&mut self.switch_after_apply);
             self.applies += 1;
             if let InputEvent::Key { down, .. } = event {
                 self.held = down;
@@ -205,14 +239,19 @@ mod tests {
             std::mem::take(&mut self.takeover)
         }
     }
+    fn request(session: &mut Session<Fake>, command: Command) -> Result<Reply> {
+        session.handle(Request {
+            version: VERSION,
+            sequence: session.sequence + 1,
+            command,
+        })
+    }
     fn send(session: &mut Session<Fake>, command: Command) -> Reply {
-        session
-            .handle(Request {
-                version: VERSION,
-                sequence: session.sequence + 1,
-                command,
-            })
-            .unwrap()
+        request(session, command).unwrap()
+    }
+    fn rejected(kind: &'static str, inserted: u32, code: u32) -> anyhow::Error {
+        anyhow::Error::new(InputInjectionError::new(kind, inserted, code))
+            .context("input agent injection failed")
     }
     fn key() -> Command {
         Command::Input {
@@ -280,7 +319,10 @@ mod tests {
         let mut session = Session::new(Fake::default());
         send(&mut session, Command::Hello);
         send(&mut session, enter(MouseMode::Relative));
-        session.backend.switch_on_apply = true;
+        session
+            .backend
+            .apply_failures
+            .push_back((true, rejected("键盘", 0, 5)));
         send(&mut session, key());
         assert_eq!(session.backend.applies, 1);
         session.backend.switch_on_position = true;
@@ -293,6 +335,90 @@ mod tests {
         ));
         assert_eq!(session.backend.applies, 2);
         assert_eq!(session.backend.enters, 3);
+    }
+
+    #[test]
+    fn first_position_retries_once_only_when_zero_insertion_races_a_desktop_switch() {
+        for mode in [MouseMode::Relative, MouseMode::ScreenRelative] {
+            for code in [0, 5] {
+                let mut session = Session::new(Fake::default());
+                send(&mut session, Command::Hello);
+                session
+                    .backend
+                    .enter_failures
+                    .push_back((true, rejected("鼠标", 0, code)));
+                send(&mut session, enter(mode));
+                assert_eq!(session.backend.enter_attempts, 2);
+                assert_eq!(session.backend.enters, 1);
+                assert_eq!(session.backend.mode, Some(mode));
+                send(&mut session, key());
+                assert_eq!(session.backend.applies, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn first_position_failure_on_an_unchanged_desktop_is_not_retried() {
+        let mut session = Session::new(Fake::default());
+        send(&mut session, Command::Hello);
+        session
+            .backend
+            .enter_failures
+            .push_back((false, rejected("鼠标", 0, 5)));
+        assert!(request(&mut session, enter(MouseMode::Relative)).is_err());
+        assert_eq!(session.backend.enter_attempts, 1);
+        assert!(session.mode.is_none());
+    }
+
+    #[test]
+    fn repeated_desktop_switches_do_not_cause_unbounded_entry_retries() {
+        let mut session = Session::new(Fake::default());
+        send(&mut session, Command::Hello);
+        for _ in 0..2 {
+            session
+                .backend
+                .enter_failures
+                .push_back((true, rejected("鼠标", 0, 5)));
+        }
+        assert!(request(&mut session, enter(MouseMode::Relative)).is_err());
+        assert_eq!(session.backend.enter_attempts, 2);
+        assert!(session.mode.is_none());
+    }
+
+    #[test]
+    fn unknown_or_nonzero_insertion_failures_are_not_retried_after_a_switch() {
+        for entering in [false, true] {
+            for error in [
+                anyhow::anyhow!("unconfirmed result"),
+                rejected("键盘", 1, 5),
+            ] {
+                let mut session = Session::new(Fake::default());
+                send(&mut session, Command::Hello);
+                if entering {
+                    session.backend.enter_failures.push_back((true, error));
+                    assert!(request(&mut session, enter(MouseMode::Relative)).is_err());
+                    assert_eq!(session.backend.enter_attempts, 1);
+                } else {
+                    send(&mut session, enter(MouseMode::Relative));
+                    session.backend.apply_failures.push_back((true, error));
+                    assert!(request(&mut session, key()).is_err());
+                    assert_eq!(session.backend.apply_attempts, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn successful_unlock_key_is_not_replayed_when_the_desktop_changes_immediately() {
+        let mut session = Session::new(Fake::default());
+        send(&mut session, Command::Hello);
+        send(&mut session, enter(MouseMode::Relative));
+        session.backend.switch_after_apply = true;
+        send(&mut session, key());
+        send(&mut session, Command::Position);
+        assert_eq!(session.backend.apply_attempts, 1);
+        assert_eq!(session.backend.applies, 1);
+        assert!(!session.backend.held);
     }
 
     #[test]

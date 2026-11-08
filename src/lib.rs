@@ -8,4 +8,5 @@ mod motion;
 mod network;
 pub mod platform;
 pub mod protocol;
+pub mod switching;
 pub mod transport;

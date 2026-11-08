@@ -273,6 +273,19 @@ impl Cluster {
                 .all(|n| n.snapshot().layout.placements() == positions)
         });
     }
+    fn arrange_row(&self) {
+        // Network connection order need not match node creation order.
+        let mut positions = self.nodes[0].snapshot().layout.placements();
+        for p in &mut positions {
+            let index = self.nodes.iter().position(|n| n.local.id == p.id).unwrap();
+            p.x = self.nodes[..index]
+                .iter()
+                .map(|n| n.local.bounds.width + 200)
+                .sum();
+            p.y = 0;
+        }
+        self.arrange(0, positions);
+    }
 }
 impl Drop for Cluster {
     fn drop(&mut self) {
@@ -315,7 +328,12 @@ fn queued_input_from_an_old_control_epoch_cannot_land_on_the_new_target() {
             down: true
         }
     )));
-    assert!(c.nodes[1].enqueue(Command::Motion(old, 100, 100)));
+    assert!(c.nodes[1].enqueue(Command::Motion {
+        epoch: old,
+        dx: 100,
+        dy: 100,
+        permit: c.nodes[1].edge_permit(),
+    }));
     c.key(1, 66);
     wait(|| c.probes[0].held.lock().unwrap().contains(&66));
     assert_eq!(c.probes[0].events.lock().unwrap().len(), 1);
@@ -356,6 +374,233 @@ fn stale_layout_revision_is_rejected_and_does_not_overwrite_newer_positions() {
     wait(|| c.nodes[1].snapshot().detail.contains("布局未保存"));
     assert_eq!(c.nodes[0].snapshot().layout.placements(), positions);
 }
+#[test]
+fn edge_conditions_gate_local_and_chained_switching_in_both_mouse_modes() {
+    use crate::switching::EdgeSwitchCondition;
+    for relative in [false, true] {
+        for (condition, key, wrong) in [
+            (EdgeSwitchCondition::Ctrl, 0xA3, 0xA1),
+            (EdgeSwitchCondition::Shift, 0xA0, 0xA2),
+        ] {
+            let c = Cluster::new(3);
+            c.arrange_row();
+            let rt = &c.nodes[0];
+            rt.relative_mouse.store(relative, Ordering::SeqCst);
+            rt.switch_gate.set_condition(condition);
+            // Keyboard sharing is independent of the physical switching key.
+            rt.keyboard.store(false, Ordering::SeqCst);
+            let edge = Point {
+                x: 1919.0,
+                y: 500.0,
+            };
+            let right = Point { x: 1.0, y: 0.0 };
+            wait(|| rt.can_switch());
+            assert!(!rt.edge_at(edge, right));
+            rt.switch_gate.observe_key(wrong, true);
+            assert!(!rt.edge_at(edge, right));
+            rt.switch_gate.observe_key(wrong, false);
+            rt.switch_gate.observe_key(key, true);
+            rt.edge.store(false, Ordering::SeqCst);
+            assert!(!rt.edge_at(edge, right));
+            rt.edge.store(true, Ordering::SeqCst);
+            assert!(rt.edge_at(edge, right));
+            wait(|| c.nodes[1].incoming.load(Ordering::SeqCst));
+            rt.switch_gate.observe_key(key, false);
+            wait(|| rt.can_switch());
+            let before = c.probes[1].events.lock().unwrap().len();
+            assert!(rt.capture(32768, 0));
+            wait(|| c.probes[1].events.lock().unwrap().len() > before);
+            // Relative feedback continues arriving, but cannot authorize a switch.
+            thread::sleep(Duration::from_millis(40));
+            assert_eq!(rt.snapshot().control.unwrap().target, c.nodes[1].local.id);
+            assert!(rt.remote.load(Ordering::SeqCst));
+            rt.switch_gate.observe_key(key, true);
+            // A press alone must not reuse the preceding denied movement.
+            thread::sleep(Duration::from_millis(40));
+            assert_eq!(rt.snapshot().control.unwrap().target, c.nodes[1].local.id);
+            assert!(rt.capture(1, 0));
+            wait(|| c.nodes[2].incoming.load(Ordering::SeqCst));
+            wait(|| rt.can_switch());
+            assert!(rt.capture(-32768, 0));
+            wait(|| c.nodes[1].incoming.load(Ordering::SeqCst));
+            wait(|| rt.can_switch());
+            assert!(rt.capture(-32768, 0));
+            wait(|| !rt.remote.load(Ordering::SeqCst));
+            assert_eq!(rt.snapshot().control.unwrap().target, rt.local.id);
+            rt.switch_gate.observe_key(key, false);
+            // Explicit control and emergency return are not gated by the key.
+            c.control(0, 2);
+            rt.reclaim();
+            wait(|| c.nodes.iter().all(|n| n.snapshot().control.is_none()));
+            assert!(!rt.sharing_enabled());
+        }
+    }
+}
+
+#[test]
+fn queued_motion_cannot_gain_permission_from_a_later_modifier_press() {
+    use crate::switching::EdgeSwitchCondition;
+    for relative in [false, true] {
+        let c = Cluster::new(3);
+        c.arrange_row();
+        let rt = &c.nodes[0];
+        rt.relative_mouse.store(relative, Ordering::SeqCst);
+        rt.switch_gate.set_condition(EdgeSwitchCondition::Ctrl);
+        wait(|| rt.can_switch());
+        assert!(rt.request_control(c.nodes[1].local.id.clone(), Point { x: 500.0, y: 500.0 }));
+        wait(|| c.nodes[1].incoming.load(Ordering::SeqCst));
+        wait(|| rt.can_switch());
+        let epoch = rt.snapshot().control.unwrap().epoch;
+        let denied = rt.edge_permit();
+        rt.switch_gate.observe_key(0xA2, true);
+        let stale = rt.edge_permit();
+        rt.switch_gate.observe_key(0xA2, false);
+        rt.switch_gate.observe_key(0xA2, true);
+        for (permit, key) in [(denied, 65), (stale, 66)] {
+            assert!(rt.enqueue(Command::Motion {
+                epoch,
+                dx: 32768,
+                dy: 0,
+                permit
+            }));
+            c.key(0, key);
+            wait(|| c.probes[1].held.lock().unwrap().contains(&key));
+            thread::sleep(Duration::from_millis(40));
+            assert_eq!(rt.snapshot().control.unwrap().target, c.nodes[1].local.id);
+        }
+        assert!(rt.capture(1, 0));
+        wait(|| c.nodes[2].incoming.load(Ordering::SeqCst));
+        wait(|| c.probes[1].held.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn removing_offline_devices_syncs_without_interrupting_control_and_allows_rejoin() {
+    let c = Cluster::new(3);
+    c.nodes[2].stop();
+    wait(|| !c.nodes[2].running.load(Ordering::SeqCst));
+    wait(|| {
+        c.nodes[..2].iter().all(|n| {
+            !n.snapshot()
+                .layout
+                .get(&c.nodes[2].local.id)
+                .unwrap()
+                .online
+        })
+    });
+    let epoch = c.control(0, 1);
+    c.key(0, 65);
+    wait(|| c.probes[1].held.lock().unwrap().contains(&65));
+    let state = c.nodes[0].snapshot();
+    c.nodes[0]
+        .remove_offline(state.revision, &c.nodes[2].local.id)
+        .unwrap();
+    wait(|| {
+        c.nodes[..2]
+            .iter()
+            .all(|n| n.snapshot().layout.get(&c.nodes[2].local.id).is_none())
+    });
+    assert_eq!(c.nodes[1].snapshot().control.unwrap().epoch, epoch);
+    assert!(c.probes[1].held.lock().unwrap().contains(&65));
+    start_with_input(
+        c.nodes[2].clone(),
+        c.configs[2].clone(),
+        [23; 32],
+        Some(c.address.clone()),
+        FakeInput {
+            probe: c.probes[2].clone(),
+            bounds: c.nodes[2].local.bounds,
+            mode: None,
+        },
+    )
+    .unwrap();
+    wait(|| {
+        c.nodes.iter().all(|n| {
+            n.snapshot()
+                .layout
+                .get(&c.nodes[2].local.id)
+                .is_some_and(|d| d.online)
+        })
+    });
+    for node in &c.nodes {
+        assert_eq!(node.snapshot().layout.devices.len(), 3);
+        assert!(node.snapshot().connected);
+    }
+}
+
+#[test]
+fn offline_removal_rechecks_revision_and_online_state_on_the_host() {
+    let c = Cluster::new(3);
+    c.nodes[2].auto_reconnect.store(false, Ordering::SeqCst);
+    c.nodes[2].enqueue(Command::DropLinks);
+    let id = &c.nodes[2].local.id;
+    wait(|| {
+        c.nodes[..2]
+            .iter()
+            .all(|n| !n.snapshot().layout.get(id).unwrap().online)
+    });
+    let old = c.nodes[0].snapshot();
+    assert!(
+        c.nodes[0]
+            .remove_offline(old.revision, &c.nodes[0].local.id)
+            .is_err()
+    );
+    assert!(
+        c.nodes[0]
+            .remove_offline(old.revision, &c.nodes[1].local.id)
+            .is_err()
+    );
+    assert!(
+        c.nodes[1]
+            .remove_offline(c.nodes[1].snapshot().revision, id)
+            .is_err()
+    );
+    c.nodes[0]
+        .arrange(old.revision, old.layout.placements())
+        .unwrap();
+    wait(|| c.nodes[0].snapshot().revision > old.revision);
+    // A queued UI command must be checked again after intervening topology edits.
+    c.nodes[0].enqueue(Command::RemoveOffline(old.revision, id.clone()));
+    wait(|| c.nodes[0].snapshot().detail.contains("设备列表已变化"));
+    assert!(c.nodes[0].snapshot().layout.get(id).is_some());
+    c.nodes[2].auto_reconnect.store(true, Ordering::SeqCst);
+    wait(|| {
+        c.nodes
+            .iter()
+            .all(|n| n.snapshot().layout.get(id).is_some_and(|d| d.online))
+    });
+    c.nodes[0].enqueue(Command::RemoveOffline(
+        c.nodes[0].snapshot().revision,
+        id.clone(),
+    ));
+    wait(|| c.nodes[0].snapshot().detail.contains("设备已在线"));
+    assert!(c.nodes.iter().all(|n| n.snapshot().connected));
+    assert!(c.nodes[0].snapshot().layout.get(id).unwrap().online);
+}
+
+#[test]
+fn stopped_profile_removal_survives_settings_roundtrip() {
+    let local = test_device(1, 1920, 1080);
+    let other = test_device(2, 1920, 1080);
+    let mut config = Config {
+        device_id: local.id.clone(),
+        ..Config::default()
+    };
+    config.layout.upsert(local.clone(), true).unwrap();
+    config.layout.upsert(other.clone(), true).unwrap();
+    let rt = Runtime::with_info(&config, local.clone());
+    let revision = rt.snapshot().revision;
+    assert!(rt.remove_offline(revision + 1, &other.id).is_err());
+    assert!(rt.remove_offline(revision, &local.id).is_err());
+    assert!(rt.remove_offline(revision, "unknown").is_err());
+    rt.remove_offline(revision, &other.id).unwrap();
+    config.layout = rt.snapshot().layout;
+    let restored = serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+    let reopened = Runtime::with_info(&restored, local);
+    assert_eq!(reopened.snapshot().layout.devices.len(), 1);
+    assert!(reopened.snapshot().layout.get(&other.id).is_none());
+}
+
 #[test]
 fn arbitrary_top_and_left_crossings_can_chain_three_devices_in_both_modes() {
     for relative in [false, true] {

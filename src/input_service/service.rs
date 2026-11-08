@@ -20,8 +20,13 @@ use windows::{
         Foundation::*,
         Security::*,
         System::{
-            JobObjects::*, Pipes::GetNamedPipeClientProcessId,
-            RemoteDesktop::WTSGetActiveConsoleSessionId, Services::*, Threading::*,
+            Diagnostics::ToolHelp::*,
+            JobObjects::*,
+            Pipes::GetNamedPipeClientProcessId,
+            RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
+            Services::*,
+            SystemInformation::GetSystemDirectoryW,
+            Threading::*,
         },
     },
     core::{PCWSTR, PWSTR},
@@ -147,7 +152,7 @@ unsafe extern "system" fn service_main(_: u32, _: *mut PWSTR) {
     status(SERVICE_STOPPED, code);
 }
 
-fn enable_privileges() -> Result<()> {
+fn enable_privileges(names: &[PCWSTR]) -> Result<()> {
     ensure!(
         identity::is_system(unsafe { GetCurrentProcess() })?,
         "输入服务必须由 LocalSystem 运行"
@@ -161,11 +166,7 @@ fn enable_privileges() -> Result<()> {
         )?;
     }
     let token = Handle(token);
-    for name in [
-        SE_TCB_NAME,
-        SE_ASSIGNPRIMARYTOKEN_NAME,
-        SE_INCREASE_QUOTA_NAME,
-    ] {
+    for &name in names {
         let mut luid = LUID::default();
         unsafe {
             LookupPrivilegeValueW(None, name, &mut luid)?;
@@ -182,6 +183,72 @@ fn enable_privileges() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Preserve the interactive SYSTEM security context, as the original service
+/// does. Changing only TokenSessionId on a session-0 service token does not
+/// reproduce the token of the target session's logon process.
+fn session_input_token(session: u32) -> Result<Handle> {
+    ensure!(
+        session != 0 && session == unsafe { WTSGetActiveConsoleSessionId() },
+        "只能为当前物理控制台创建输入代理"
+    );
+    let mut directory = vec![0u16; 32768];
+    let length = unsafe { GetSystemDirectoryW(Some(&mut directory)) } as usize;
+    ensure!(
+        length > 0 && length < directory.len(),
+        "无法读取 Windows 系统目录"
+    );
+    let image =
+        std::path::PathBuf::from(String::from_utf16(&directory[..length])?).join("winlogon.exe");
+    let snapshot = Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? });
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    unsafe { Process32FirstW(snapshot.0, &mut entry)? };
+    loop {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        if String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case("winlogon.exe") {
+            let mut actual_session = 0;
+            if unsafe { ProcessIdToSessionId(entry.th32ProcessID, &mut actual_session) }.is_ok()
+                && actual_session == session
+            {
+                // Verify the full system image, account and session, and keep
+                // its handle alive while opening the token to prevent PID reuse.
+                let process =
+                    identity::verify_peer(entry.th32ProcessID, session, &image, true, None)
+                        .context("核验当前会话的 Winlogon")?;
+                let mut source = HANDLE::default();
+                unsafe {
+                    OpenProcessToken(process.0, TOKEN_DUPLICATE | TOKEN_QUERY, &mut source)
+                        .context("读取当前会话的 Winlogon 令牌")?;
+                }
+                let source = Handle(source);
+                let mut token = HANDLE::default();
+                unsafe {
+                    DuplicateTokenEx(
+                        source.0,
+                        TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
+                        None,
+                        SecurityImpersonation,
+                        TokenPrimary,
+                        &mut token,
+                    )
+                    .context("创建会话输入代理令牌")?;
+                }
+                return Ok(Handle(token));
+            }
+        }
+        if unsafe { Process32NextW(snapshot.0, &mut entry) }.is_err() {
+            break;
+        }
+    }
+    bail!("当前物理控制台的 Winlogon 尚未就绪")
 }
 
 struct Worker {
@@ -208,38 +275,10 @@ impl Worker {
         let mut command = pipe::wide(&format!(
             "\"{exe_text}\" --worker {session} {parent} {stop_name}"
         ));
-        let mut source = HANDLE::default();
-        unsafe {
-            OpenProcessToken(
-                GetCurrentProcess(),
-                TOKEN_DUPLICATE | TOKEN_QUERY,
-                &mut source,
-            )?;
-        }
-        let source = Handle(source);
+        let token = session_input_token(session)?;
         // Clients query only the worker's image/session and SCM-owned parent.
         // Its SYSTEM token keeps the default SYSTEM/administrator permissions.
         let process_sd = identity::worker_process_descriptor(&user)?;
-        let mut token = HANDLE::default();
-        unsafe {
-            DuplicateTokenEx(
-                source.0,
-                TOKEN_ALL_ACCESS,
-                None,
-                SecurityImpersonation,
-                TokenPrimary,
-                &mut token,
-            )?;
-        }
-        let token = Handle(token);
-        unsafe {
-            SetTokenInformation(
-                token.0,
-                TokenSessionId,
-                (&session as *const u32).cast(),
-                size_of::<u32>() as u32,
-            )?;
-        }
         let job = Handle(unsafe { CreateJobObjectW(None, None)? });
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -251,7 +290,10 @@ impl Worker {
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )?;
         }
-        let mut desktop = pipe::wide(r"winsta0\default");
+        // Bootstrap on the secure desktop, like the original Winlogon agent.
+        // The windowless input thread can subsequently follow Default/Winlogon
+        // after removing its hooks; the service itself remains in session 0.
+        let mut desktop = pipe::wide(r"winsta0\winlogon");
         let startup = STARTUPINFOW {
             cb: size_of::<STARTUPINFOW>() as u32,
             lpDesktop: PWSTR(desktop.as_mut_ptr()),
@@ -271,7 +313,8 @@ impl Worker {
                 PCWSTR(directory.as_ptr()),
                 &startup,
                 &mut process,
-            )?;
+            )
+            .context("在 Winlogon 桌面启动会话输入代理")?;
         }
         let child = Handle(process.hProcess);
         let child_thread = Handle(process.hThread);
@@ -315,7 +358,12 @@ impl Drop for Worker {
 }
 
 fn supervise() -> Result<()> {
-    enable_privileges()?;
+    enable_privileges(&[
+        SE_TCB_NAME,
+        SE_ASSIGNPRIMARYTOKEN_NAME,
+        SE_INCREASE_QUOTA_NAME,
+        SE_DEBUG_NAME,
+    ])?;
     status(SERVICE_RUNNING, 0);
     let mut worker: Option<Worker> = None;
     let mut retry = Instant::now();
@@ -345,7 +393,9 @@ fn supervise() -> Result<()> {
 }
 
 fn worker(session: u32, parent: u32, stop_name: &str) -> Result<()> {
-    enable_privileges()?;
+    // The worker only queries the console logon identity. Process/token launch
+    // privileges are required by its session-0 supervisor, not this input loop.
+    enable_privileges(&[SE_TCB_NAME])?;
     ensure!(
         identity::current_session()? == session && session != 0,
         "输入代理会话无效"

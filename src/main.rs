@@ -15,6 +15,7 @@ use mwb::{
     exchange::{Phase, format_size},
     layout::{Layout, Point as LayoutPoint},
     platform,
+    switching::EdgeSwitchCondition,
 };
 use std::{
     sync::{Arc, Mutex, atomic::Ordering},
@@ -485,6 +486,9 @@ impl Workspace {
             self.layout_draft = state.layout;
             self.layout_revision = state.revision;
         }
+        if self.layout_draft.get(&self.selected).is_none() {
+            self.selected = self.runtime.local.id.clone();
+        }
         if self.fit_pending {
             self.fit_canvas();
         }
@@ -675,6 +679,11 @@ impl Workspace {
 
     fn devices(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let saved = self.runtime.snapshot();
+        let selected_offline = saved
+            .layout
+            .get(&self.selected)
+            .is_some_and(|d| !d.online && d.info.id != self.runtime.local.id);
+        let can_remove = !self.runtime.running.load(Ordering::SeqCst) || saved.host;
         let invalid = self.layout_draft.validate().err().map(|e| e.to_string());
         let bounds = self.canvas_bounds.clone();
         let mut area = div()
@@ -892,6 +901,44 @@ impl Workspace {
                     ),
             )
             .child(area)
+            .when(selected_offline, |el| {
+                el.child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(subtle(if !can_remove {
+                            "在连接中心可移除离线设备；停止连接后可清理本机记录。"
+                        } else if self.layout_dirty {
+                            "请先保存或还原布局，再移除离线设备。"
+                        } else {
+                            "移除后释放设备名额；该设备仍可使用相同密钥重新加入。"
+                        }))
+                        .child(
+                            Button::new("remove-offline-device")
+                                .small()
+                                .label("移除选中离线设备")
+                                .disabled(
+                                    !can_remove
+                                        || self.layout_dirty
+                                        || self.preparing
+                                        || self.drag.is_some(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.notice = match this
+                                        .runtime
+                                        .remove_offline(this.layout_revision, &this.selected)
+                                    {
+                                        Ok(()) => "移除请求已提交，设备列表更新后自动保存。".into(),
+                                        Err(e) => format!("{e:#}"),
+                                    };
+                                    this.refresh_layout();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(div().h_flex().flex_wrap().gap_2().children(
                 self.layout_draft.devices.iter().map(|d| {
                     let id = d.info.id.clone();
@@ -1274,6 +1321,34 @@ impl Workspace {
                         this.persist();
                         cx.notify();
                     })),
+            ))
+            .child(option_row(
+                "边缘切换条件",
+                "仅影响自动跨屏；左右 Ctrl / Shift 均可，手动控制和紧急返回始终可用。",
+                div().h_flex().gap_2().children(
+                    [
+                        (EdgeSwitchCondition::Always, "直接切换"),
+                        (EdgeSwitchCondition::Ctrl, "按住 Ctrl"),
+                        (EdgeSwitchCondition::Shift, "按住 Shift"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (condition, label))| {
+                        Button::new(("edge-condition", i))
+                            .small()
+                            .label(label)
+                            .when(self.config.edge_switch_condition == condition, |b| {
+                                b.primary()
+                            })
+                            .disabled(!self.config.edge_switch)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.config.edge_switch_condition = condition;
+                                this.runtime.switch_gate.set_condition(condition);
+                                this.persist();
+                                cx.notify();
+                            }))
+                    }),
+                ),
             ))
             .child(option_row(
                 "避开屏幕角落",

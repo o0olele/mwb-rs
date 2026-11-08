@@ -12,6 +12,7 @@ pub struct Config {
     pub peer_address: String,
     pub port: u16,
     pub edge_switch: bool,
+    pub edge_switch_condition: crate::switching::EdgeSwitchCondition,
     pub keyboard: bool,
     pub relative_mouse: bool,
     pub auto_reconnect: bool,
@@ -30,6 +31,7 @@ impl Default for Config {
             peer_address: String::new(),
             port: 24810,
             edge_switch: true,
+            edge_switch_condition: crate::switching::EdgeSwitchCondition::Always,
             keyboard: true,
             relative_mouse: false,
             auto_reconnect: true,
@@ -160,14 +162,23 @@ mod tests {
         assert!(!config.keyboard);
         assert!(config.auto_reconnect);
         assert!(!config.block_corners);
+        assert_eq!(
+            config.edge_switch_condition,
+            crate::switching::EdgeSwitchCondition::Always
+        );
         let mut config = config;
         config.relative_mouse = true;
         config.auto_reconnect = false;
         config.block_corners = true;
+        config.edge_switch_condition = crate::switching::EdgeSwitchCondition::Shift;
         let saved = serde_json::to_vec(&config).unwrap();
         let restored: Config = serde_json::from_slice(&saved).unwrap();
         assert!(!restored.auto_reconnect);
         assert!(restored.block_corners);
+        assert_eq!(
+            restored.edge_switch_condition,
+            crate::switching::EdgeSwitchCondition::Shift
+        );
         assert!(
             serde_json::from_slice::<Config>(&saved)
                 .unwrap()

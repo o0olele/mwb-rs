@@ -9,6 +9,7 @@ use crate::{
     network::{self, Event, Link},
     platform::{self, InputInjectionError, InputServiceError, LocalInputTakeover},
     protocol::{Control, InputEvent, Message, MouseMode},
+    switching::{EdgePermit, SwitchGate},
 };
 use anyhow::{Result, bail, ensure};
 use std::{
@@ -42,9 +43,15 @@ enum Command {
         target: String,
         point: Point,
     },
-    Motion(u64, i32, i32),
+    Motion {
+        epoch: u64,
+        dx: i32,
+        dy: i32,
+        permit: Option<EdgePermit>,
+    },
     Input(u64, InputEvent),
     Arrange(u64, Vec<Placement>),
+    RemoveOffline(u64, String),
 }
 pub struct Runtime {
     pub exchange: Exchange,
@@ -58,6 +65,7 @@ pub struct Runtime {
     pub incoming: AtomicBool,
     pub keyboard: AtomicBool,
     pub edge: AtomicBool,
+    pub switch_gate: SwitchGate,
     pub relative_mouse: AtomicBool,
     pub auto_reconnect: AtomicBool,
     pub block_corners: AtomicBool,
@@ -103,6 +111,7 @@ impl Runtime {
             incoming: AtomicBool::new(false),
             keyboard: AtomicBool::new(config.keyboard),
             edge: AtomicBool::new(config.edge_switch),
+            switch_gate: SwitchGate::new(config.edge_switch_condition),
             relative_mouse: AtomicBool::new(config.relative_mouse),
             auto_reconnect: AtomicBool::new(config.auto_reconnect),
             block_corners: AtomicBool::new(config.block_corners),
@@ -216,7 +225,7 @@ impl Runtime {
         }
     }
     pub(crate) fn edge_at(&self, p: Point, delta: Point) -> bool {
-        if !self.sharing_enabled() || !self.edge.load(Ordering::SeqCst) || !self.can_switch() {
+        if !self.sharing_enabled() || self.edge_permit().is_none() || !self.can_switch() {
             return false;
         }
         let next = self.status.try_lock().ok().and_then(|s| {
@@ -230,11 +239,18 @@ impl Runtime {
         next.is_some_and(|(id, p)| self.request_control(id, p))
     }
     pub(crate) fn capture(&self, dx: i32, dy: i32) -> bool {
-        self.enqueue(Command::Motion(
-            self.capture_epoch.load(Ordering::SeqCst),
+        self.enqueue(Command::Motion {
+            epoch: self.capture_epoch.load(Ordering::SeqCst),
             dx,
             dy,
-        ))
+            permit: self.edge_permit(),
+        })
+    }
+    fn edge_permit(&self) -> Option<EdgePermit> {
+        self.edge
+            .load(Ordering::SeqCst)
+            .then(|| self.switch_gate.permit())
+            .flatten()
     }
     pub(crate) fn send_input(&self, event: InputEvent) -> bool {
         self.enqueue(Command::Input(
@@ -260,6 +276,24 @@ impl Runtime {
             ensure!(s.revision == revision, "布局已变化，请重试");
             s.layout = s.layout.positioned(&positions)?;
             s.revision += 1;
+        }
+        Ok(())
+    }
+    pub fn remove_offline(&self, revision: u64, id: &str) -> Result<()> {
+        let mut state = self.status.lock().unwrap();
+        ensure!(id != self.local.id, "不能移除本机");
+        ensure!(state.revision == revision, "设备列表已变化，请刷新后重试");
+        let layout = state.layout.without_offline(id)?;
+        if self.running.load(Ordering::SeqCst) {
+            ensure!(state.host, "请在连接中心移除离线设备，或先停止连接");
+            drop(state);
+            ensure!(
+                self.enqueue(Command::RemoveOffline(revision, id.into())),
+                "设备管理队列不可用"
+            );
+        } else {
+            state.layout = layout;
+            state.revision += 1;
         }
         Ok(())
     }
@@ -363,6 +397,7 @@ fn start_with_input(
             control: None,
             epoch: 0,
             motion: None,
+            edge_permit: None,
             pending: None,
             last_cursor: Instant::now(),
         };
@@ -456,6 +491,7 @@ struct Group {
     control: Option<Control>,
     epoch: u64,
     motion: Option<RemoteMotion>,
+    edge_permit: Option<EdgePermit>,
     pending: Option<Instant>,
     last_cursor: Instant,
 }
@@ -634,12 +670,18 @@ impl Group {
                 Ok(())
             }
             Command::Take { target, point } => self.take(target, point, input),
-            Command::Motion(epoch, dx, dy) => {
+            Command::Motion {
+                epoch,
+                dx,
+                dy,
+                permit,
+            } => {
                 if self
                     .control
                     .as_ref()
                     .is_some_and(|c| c.epoch == epoch && c.controller == self.rt.local.id)
                 {
+                    self.edge_permit = permit;
                     self.motion(dx, dy, input)
                 } else {
                     Ok(())
@@ -670,6 +712,20 @@ impl Group {
                 },
                 input,
             ),
+            Command::RemoveOffline(revision, id) => {
+                ensure!(
+                    self.host && id != self.rt.local.id,
+                    "只能由连接中心移除其他离线设备"
+                );
+                ensure!(revision == self.revision, "设备列表已变化，请刷新后重试");
+                self.layout = self.layout.without_offline(&id)?;
+                self.revision += 1;
+                self.publish();
+                self.broadcast(self.topology());
+                self.rt
+                    .log("离线设备已移除并同步；该设备仍可使用相同密钥重新加入");
+                Ok(())
+            }
         }
     }
     fn take(&mut self, target: String, point: Point, input: &mut impl SessionInput) -> Result<()> {
@@ -835,6 +891,7 @@ impl Group {
         input.release_all();
         self.pending = None;
         self.motion = None;
+        self.edge_permit = None;
         self.rt.capture_epoch.store(0, Ordering::SeqCst);
         self.rt.remote.store(false, Ordering::SeqCst);
         self.rt.incoming.store(false, Ordering::SeqCst);
@@ -985,7 +1042,12 @@ impl Group {
         Ok(())
     }
     fn try_cross(&mut self, input: &mut impl SessionInput) -> Result<bool> {
-        if self.pending.is_some() || !self.rt.can_switch() || !self.rt.edge.load(Ordering::SeqCst) {
+        if self.pending.is_some()
+            || !self.rt.sharing_enabled()
+            || !self.rt.can_switch()
+            || !self.rt.edge.load(Ordering::SeqCst)
+            || !self.rt.switch_gate.allows(self.edge_permit)
+        {
             return Ok(false);
         }
         let next = self

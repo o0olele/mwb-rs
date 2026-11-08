@@ -156,13 +156,17 @@ impl Backend for DesktopInput {
         }
     }
     fn enter(&mut self, point: Point, mode: MouseMode) -> Result<()> {
-        self.native.enter_at(point, mode)?;
+        self.native
+            .enter_at(point, mode)
+            .context("会话输入代理在当前桌面定位失败")?;
         TAKEOVER.store(false, Ordering::SeqCst);
         ACTIVE.store(true, Ordering::SeqCst);
         Ok(())
     }
     fn apply(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
-        self.native.apply_event(event, keyboard)
+        self.native
+            .apply_event(event, keyboard)
+            .context("会话输入代理在当前桌面注入失败")
     }
     fn position(&mut self) -> Result<Point> {
         platform::cursor_position()

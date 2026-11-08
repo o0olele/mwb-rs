@@ -18,7 +18,7 @@ pub(super) trait Environment {
     fn connect_service(&mut self) -> Result<Self::Service>;
 }
 
-/// Keep ordinary desktop input independent of optional service permissions.
+/// Successful ordinary desktop input never needs the optional service.
 /// Once a control session moves to the service, keep it there until release:
 /// a failed service reply may follow an already-inserted event.
 pub(super) struct Receiver<N: Backend, E: Environment> {
@@ -44,9 +44,9 @@ impl<N: Backend, E: Environment> Receiver<N, E> {
         self.release();
         let result = if self.environment.native_available()? {
             match self.native.enter(point, mode) {
-                Err(error) if self.native_rejected_during_switch(&error)? => {
-                    self.connect_and_enter(point, mode)
-                }
+                Err(error) if nothing_inserted(&error) => self
+                    .connect_and_enter(point, mode)
+                    .with_context(|| format!("普通桌面定位未插入事件：{error:#}")),
                 result => result,
             }
         } else {
@@ -81,24 +81,20 @@ impl<N: Backend, E: Environment> Receiver<N, E> {
         Ok(())
     }
 
-    fn native_rejected_during_switch(&mut self, error: &anyhow::Error) -> Result<bool> {
-        let uninserted = error
-            .downcast_ref::<InputInjectionError>()
-            .is_some_and(|e| e.inserted == 0);
-        Ok(uninserted && !self.environment.native_available()?)
-    }
-
     pub fn apply(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
         self.follow_desktop()?;
         if let Some(service) = self.service.as_mut() {
             service.apply(event.clone(), keyboard)?;
         } else if let Err(error) = self.native.apply(event.clone(), keyboard) {
-            if !self.native_rejected_during_switch(&error)? {
+            if !nothing_inserted(&error) {
                 return Err(error);
             }
-            // The desktop changed between our readiness check and SendInput.
-            // Retry exactly once, only when the native event was not inserted.
-            self.follow_desktop()?;
+            // An active desktop is not proof that this process can inject into
+            // it (UIPI and login transitions can reject SendInput). Promote only
+            // an explicitly uninserted event, even if UOI_IO is still true.
+            let mode = self.mode.context("没有活动输入会话")?;
+            self.connect_and_enter(self.point, mode)
+                .with_context(|| format!("普通桌面输入未插入事件：{error:#}"))?;
             self.service
                 .as_mut()
                 .context("锁屏输入服务未连接")?
@@ -145,6 +141,12 @@ impl<N: Backend, E: Environment> Receiver<N, E> {
     }
 }
 
+fn nothing_inserted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<InputInjectionError>()
+        .is_some_and(InputInjectionError::nothing_inserted)
+}
+
 impl<N: Backend + Default, E: Environment + Default> Default for Receiver<N, E> {
     fn default() -> Self {
         Self::new(N::default(), E::default())
@@ -172,6 +174,7 @@ mod tests {
         fail_service_after_input: AtomicBool,
         switch_during_native_input: AtomicBool,
         switch_during_native_enter: AtomicBool,
+        native_error: Mutex<Option<anyhow::Error>>,
         connects: AtomicUsize,
         native_enters: AtomicUsize,
         native_releases: AtomicUsize,
@@ -205,6 +208,9 @@ mod tests {
                 self.0.native_available.store(false, Ordering::SeqCst);
                 return Err(InputInjectionError::new("鼠标", 0, 5).into());
             }
+            if let Some(error) = self.0.native_error.lock().unwrap().take() {
+                return Err(error);
+            }
             self.0.native_enters.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -216,6 +222,9 @@ mod tests {
             {
                 self.0.native_available.store(false, Ordering::SeqCst);
                 return Err(InputInjectionError::new("键盘", 0, 5).into());
+            }
+            if let Some(error) = self.0.native_error.lock().unwrap().take() {
+                return Err(error);
             }
             self.0.native_events.lock().unwrap().push(event);
             Ok(())
@@ -336,6 +345,58 @@ mod tests {
             *probe.service_enters.lock().unwrap(),
             vec![(point, MouseMode::ScreenRelative)]
         );
+    }
+
+    #[test]
+    fn rejected_native_input_migrates_even_while_the_desktop_reports_active() {
+        for mode in [MouseMode::Relative, MouseMode::ScreenRelative] {
+            for code in [0, 5] {
+                let (mut input, probe) = receiver(true);
+                input.enter(Point::default(), mode).unwrap();
+                let point = input.position().unwrap();
+                *probe.native_error.lock().unwrap() = Some(
+                    anyhow::Error::new(InputInjectionError::new("键盘", 0, code))
+                        .context("SendInput rejected on an active desktop"),
+                );
+                input.apply(key(), true).unwrap();
+                assert!(probe.native_available.load(Ordering::SeqCst));
+                assert_eq!(probe.connects.load(Ordering::SeqCst), 1);
+                assert_eq!(*probe.service_enters.lock().unwrap(), vec![(point, mode)]);
+                assert_eq!(*probe.service_events.lock().unwrap(), vec![key()]);
+                assert!(probe.native_events.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_first_position_migrates_even_while_the_desktop_reports_active() {
+        let point = Point { x: 10.0, y: 20.0 };
+        for code in [0, 5] {
+            let (mut input, probe) = receiver(true);
+            *probe.native_error.lock().unwrap() =
+                Some(InputInjectionError::new("鼠标", 0, code).into());
+            input.enter(point, MouseMode::ScreenRelative).unwrap();
+            assert_eq!(probe.native_enters.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                *probe.service_enters.lock().unwrap(),
+                vec![(point, MouseMode::ScreenRelative)]
+            );
+        }
+    }
+
+    #[test]
+    fn unconfirmed_native_errors_are_never_replayed_through_the_service() {
+        for error in [
+            anyhow::anyhow!("unknown input result"),
+            InputInjectionError::new("键盘", 1, 5).into(),
+        ] {
+            let (mut input, probe) = receiver(true);
+            input.enter(Point::default(), MouseMode::Relative).unwrap();
+            *probe.native_error.lock().unwrap() = Some(error);
+            assert!(input.apply(key(), true).is_err());
+            assert_eq!(probe.connects.load(Ordering::SeqCst), 0);
+            assert!(probe.service_events.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
