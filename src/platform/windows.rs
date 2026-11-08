@@ -468,6 +468,17 @@ impl Injector {
 struct WindowsEnvironment;
 impl Environment for WindowsEnvironment {
     type Service = crate::input_service::Client;
+    fn preferred_service(&mut self) -> Result<Option<Self::Service>> {
+        let result = crate::input_service::Client::connect_installed();
+        if let Err(error) = &result
+            && let Some(rt) = RUNTIME.get()
+        {
+            rt.log(format!(
+                "输入服务握手未完成，普通桌面尝试直接输入：{error:#}"
+            ));
+        }
+        result
+    }
     fn native_available(&mut self) -> Result<bool> {
         let result = (|| -> Result<bool> {
             let mut active = ::windows::core::BOOL::default();
@@ -490,7 +501,7 @@ impl Environment for WindowsEnvironment {
             .map_err(|e| InputServiceError(format!("锁屏输入服务连接失败：{e:#}")))?
             .ok_or_else(|| {
                 InputServiceError(
-                    "当前桌面不可访问；锁屏控制需要在被控端安装输入服务，并运行安装目录中的 MWB"
+                    "当前输入需要服务权限；管理员窗口和锁屏控制需要在被控端安装输入服务，并运行安装目录中的 MWB"
                         .into(),
                 )
                 .into()
@@ -500,7 +511,11 @@ impl Environment for WindowsEnvironment {
 
 impl Backend for crate::input_service::Client {
     fn enter(&mut self, point: Point, mode: MouseMode) -> Result<()> {
-        Self::enter(self, point, mode)
+        Self::enter(self, point, mode)?;
+        if let Some(rt) = RUNTIME.get() {
+            rt.log("接收端输入后端：SYSTEM 服务代理");
+        }
+        Ok(())
     }
     fn apply(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
         Self::apply(self, event, keyboard)
@@ -608,7 +623,11 @@ impl Drop for NativeInjector {
 
 impl Backend for NativeInjector {
     fn enter(&mut self, point: Point, mode: MouseMode) -> Result<()> {
-        self.enter_at(point, mode)
+        self.enter_at(point, mode)?;
+        if let Some(rt) = RUNTIME.get() {
+            rt.log("接收端输入后端：普通桌面；管理员窗口需运行安装版并启动输入服务");
+        }
+        Ok(())
     }
     fn apply(&mut self, event: InputEvent, keyboard: bool) -> Result<()> {
         self.apply_event(event, keyboard)

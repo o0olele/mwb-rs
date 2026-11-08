@@ -14,11 +14,15 @@ pub(super) trait Backend {
 
 pub(super) trait Environment {
     type Service: Backend;
+    /// Authentication/Hello only; this must not send any input. A failure can
+    /// safely fall back to native input when the ordinary desktop is available.
+    fn preferred_service(&mut self) -> Result<Option<Self::Service>>;
     fn native_available(&mut self) -> Result<bool>;
     fn connect_service(&mut self) -> Result<Self::Service>;
 }
 
-/// Successful ordinary desktop input never needs the optional service.
+/// Prefer an authenticated service before the first input, so focusing an
+/// elevated window does not depend on detecting a failed native injection.
 /// Once a control session moves to the service, keep it there until release:
 /// a failed service reply may follow an already-inserted event.
 pub(super) struct Receiver<N: Backend, E: Environment> {
@@ -42,7 +46,11 @@ impl<N: Backend, E: Environment> Receiver<N, E> {
 
     pub fn enter(&mut self, point: Point, mode: MouseMode) -> Result<()> {
         self.release();
-        let result = if self.environment.native_available()? {
+        let result = if let Ok(Some(service)) = self.environment.preferred_service() {
+            // Only connection/Hello may fall back. Once Enter has been sent,
+            // a lost acknowledgement may follow a successful positioning event.
+            self.enter_service(service, point, mode)
+        } else if self.environment.native_available()? {
             match self.native.enter(point, mode) {
                 Err(error) if nothing_inserted(&error) => self
                     .connect_and_enter(point, mode)
@@ -67,8 +75,20 @@ impl<N: Backend, E: Environment> Receiver<N, E> {
 
     fn connect_and_enter(&mut self, point: Point, mode: MouseMode) -> Result<()> {
         self.native.release();
-        let mut service = self.environment.connect_service()?;
-        service.enter(point, mode)?;
+        let service = self.environment.connect_service()?;
+        self.enter_service(service, point, mode)
+    }
+
+    fn enter_service(
+        &mut self,
+        mut service: E::Service,
+        point: Point,
+        mode: MouseMode,
+    ) -> Result<()> {
+        if let Err(error) = service.enter(point, mode) {
+            service.release();
+            return Err(error);
+        }
         self.service = Some(service);
         Ok(())
     }
@@ -170,12 +190,16 @@ mod tests {
     #[derive(Default)]
     struct Probe {
         native_available: AtomicBool,
+        prefer_service: AtomicBool,
         deny_service: AtomicBool,
+        fail_service_enter: AtomicBool,
         fail_service_after_input: AtomicBool,
         switch_during_native_input: AtomicBool,
         switch_during_native_enter: AtomicBool,
         native_error: Mutex<Option<anyhow::Error>>,
         connects: AtomicUsize,
+        preferred_checks: AtomicUsize,
+        service_releases: AtomicUsize,
         native_enters: AtomicUsize,
         native_releases: AtomicUsize,
         native_events: Mutex<Vec<InputEvent>>,
@@ -187,6 +211,14 @@ mod tests {
     struct FakeEnvironment(Arc<Probe>);
     impl Environment for FakeEnvironment {
         type Service = FakeService;
+        fn preferred_service(&mut self) -> Result<Option<FakeService>> {
+            self.0.preferred_checks.fetch_add(1, Ordering::SeqCst);
+            if self.0.prefer_service.load(Ordering::SeqCst) {
+                self.connect_service().map(Some)
+            } else {
+                Ok(None)
+            }
+        }
         fn native_available(&mut self) -> Result<bool> {
             Ok(self.0.native_available.load(Ordering::SeqCst))
         }
@@ -239,6 +271,9 @@ mod tests {
     impl Backend for FakeService {
         fn enter(&mut self, point: Point, mode: MouseMode) -> Result<()> {
             self.0.service_enters.lock().unwrap().push((point, mode));
+            if self.0.fail_service_enter.load(Ordering::SeqCst) {
+                return Err(InputServiceError("服务已定位但确认丢失".into()).into());
+            }
             Ok(())
         }
         fn apply(&mut self, event: InputEvent, _: bool) -> Result<()> {
@@ -251,7 +286,9 @@ mod tests {
         fn position(&mut self) -> Result<Point> {
             Ok(Point { x: 40.0, y: 50.0 })
         }
-        fn release(&mut self) {}
+        fn release(&mut self) {
+            self.0.service_releases.fetch_add(1, Ordering::SeqCst);
+        }
     }
     fn key() -> InputEvent {
         InputEvent::Key {
@@ -287,6 +324,91 @@ mod tests {
     }
 
     #[test]
+    fn installed_service_handles_the_first_click_and_keeps_the_button_pair_together() {
+        for mode in [MouseMode::Relative, MouseMode::ScreenRelative] {
+            let (mut input, probe) = receiver(true);
+            probe.prefer_service.store(true, Ordering::SeqCst);
+            let point = Point { x: 10.0, y: 20.0 };
+            input.enter(point, mode).unwrap();
+            let events = vec![
+                InputEvent::Button {
+                    button: 1,
+                    down: true,
+                },
+                InputEvent::Button {
+                    button: 1,
+                    down: false,
+                },
+                if mode == MouseMode::Relative {
+                    InputEvent::Relative { dx: 3, dy: 1 }
+                } else {
+                    InputEvent::Absolute { x: 20, y: 30 }
+                },
+                InputEvent::Wheel {
+                    delta: 120,
+                    horizontal: false,
+                },
+                key(),
+            ];
+            for event in &events {
+                input.apply(event.clone(), true).unwrap();
+            }
+            input.position().unwrap();
+            assert_eq!(probe.native_enters.load(Ordering::SeqCst), 0);
+            assert!(probe.native_events.lock().unwrap().is_empty());
+            assert_eq!(*probe.service_enters.lock().unwrap(), vec![(point, mode)]);
+            assert_eq!(*probe.service_events.lock().unwrap(), events);
+            assert_eq!(probe.connects.load(Ordering::SeqCst), 1);
+            input.release();
+            assert_eq!(probe.service_releases.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn optional_service_authentication_failure_does_not_break_the_ordinary_desktop() {
+        let (mut input, probe) = receiver(true);
+        probe.prefer_service.store(true, Ordering::SeqCst);
+        probe.deny_service.store(true, Ordering::SeqCst);
+        input.enter(Point::default(), MouseMode::Relative).unwrap();
+        input.apply(key(), true).unwrap();
+        assert_eq!(probe.native_enters.load(Ordering::SeqCst), 1);
+        assert_eq!(*probe.native_events.lock().unwrap(), vec![key()]);
+        assert!(probe.service_events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_service_entry_never_replays_position_on_the_native_backend() {
+        let (mut input, probe) = receiver(true);
+        probe.prefer_service.store(true, Ordering::SeqCst);
+        probe.fail_service_enter.store(true, Ordering::SeqCst);
+        let error = input
+            .enter(Point::default(), MouseMode::Relative)
+            .unwrap_err();
+        assert!(error.is::<InputServiceError>());
+        assert_eq!(probe.native_enters.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.service_enters.lock().unwrap().len(), 1);
+        assert_eq!(probe.service_releases.load(Ordering::SeqCst), 1);
+        assert!(input.mode.is_none());
+    }
+
+    #[test]
+    fn service_returning_after_native_fallback_is_selected_on_the_next_control_session() {
+        let (mut input, probe) = receiver(true);
+        probe.prefer_service.store(true, Ordering::SeqCst);
+        probe.deny_service.store(true, Ordering::SeqCst);
+        input.enter(Point::default(), MouseMode::Relative).unwrap();
+        input.apply(key(), true).unwrap();
+        // Do not switch a live button/key session just because the service
+        // became available. Release and acquire a fresh control session first.
+        probe.deny_service.store(false, Ordering::SeqCst);
+        input.enter(Point::default(), MouseMode::Relative).unwrap();
+        input.apply(key(), true).unwrap();
+        assert_eq!(probe.preferred_checks.load(Ordering::SeqCst), 2);
+        assert_eq!(*probe.native_events.lock().unwrap(), vec![key()]);
+        assert_eq!(*probe.service_events.lock().unwrap(), vec![key()]);
+    }
+
+    #[test]
     fn lock_migrates_mode_and_last_position_once_and_keeps_service_until_release() {
         for mode in [MouseMode::Relative, MouseMode::ScreenRelative] {
             let (mut input, probe) = receiver(true);
@@ -311,6 +433,7 @@ mod tests {
     #[test]
     fn missing_secure_desktop_permission_is_reported_without_faking_native_success() {
         let (mut input, probe) = receiver(false);
+        probe.prefer_service.store(true, Ordering::SeqCst);
         probe.deny_service.store(true, Ordering::SeqCst);
         let error = input
             .enter(Point::default(), MouseMode::Relative)

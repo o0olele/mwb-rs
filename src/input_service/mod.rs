@@ -24,7 +24,7 @@ pub fn installation_notice() -> Option<String> {
         return None;
     }
     Some(format!(
-        "本机锁屏输入需使用安装版。请关闭此窗口后运行：{}",
+        "本机管理员窗口和锁屏控制需使用安装版。请关闭此窗口后运行：{}",
         installed.display()
     ))
 }

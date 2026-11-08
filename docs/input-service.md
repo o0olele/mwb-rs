@@ -2,6 +2,12 @@
 
 本实现针对“控制端保持解锁，被控端已运行 MWB 并连接工作组，随后锁屏”的场景。安装可选服务后，接收端输入由登录会话中的 LocalSystem 代理执行。服务仅接收键鼠命令；网络认证、工作组、剪贴板和文件传输继续由普通用户主程序负责。
 
+v0.5.6 扩展安装版的服务选择时机：用户已确认 v0.5.5 的 PIN 输入正常，但管理员 PowerShell 无法点击，从任务栏切入后失去控制；非管理员 PowerShell 正常，网络仍显示已连接且没有输入错误日志。原实现普通桌面先用普通权限注入，只有桌面不可访问或 `SendInput` 明确失败后才迁入服务，未在高权限窗口获得焦点前选择代理。
+
+现在安装版在接收控制时先完成服务身份校验和 Hello，再通过 SYSTEM 代理执行首次定位、按下、释放及后续输入。同一会话保持同一后端，覆盖普通窗口、任务栏及管理员窗口之间的焦点变化。服务只在主程序路径与注册安装目录匹配时被优先尝试；便携/开发副本保持普通输入。服务不存在、未运行或握手失败时，普通桌面仍可使用直接输入；已发送服务 Enter 或任何输入后发生错误，则结束控制并报告错误，结果不明的事件不会回退重放。
+
+连接记录新增 `接收端输入后端：SYSTEM 服务代理` 或普通桌面提示，便于核验管理员窗口是否实际使用服务。高权限应用的输入受 Windows UIPI 限制，使用 SYSTEM 服务控制此类窗口也是微软官方 Mouse Without Borders 的服务用途，见 [SendInput 限制](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)、[服务与高权限应用](https://learn.microsoft.com/en-us/windows/powertoys/mouse-without-borders#install-mouse-without-borders-as-a-service)。本版网络协议仍为 5、本地输入服务协议仍为 3；尚需在用户的管理员 PowerShell 上复测。
+
 v0.5.5 根据用户提供的 v0.5.4 失败日志继续定位：代理与物理控制台会话均为 15，SYSTEM 身份、系统完整性级别、UIAccess、`WinSta0` 及 `Winlogon` 线程/输入桌面都匹配，首次定位仍返回 0/5。这说明该次失败没有缺少前述令牌和桌面条件；此前没有检查**桌面句柄本身的实际访问权限**。
 
 打开输入桌面时原先请求的掩码为 `0x189`，漏了 `DESKTOP_JOURNALPLAYBACK (0x20)`。本版请求 `0x1a9`，并在调用 `SetThreadDesktop` 前通过动态加载的 `NtQueryObject(ObjectBasicInformation)` 核验 `GrantedAccess`。访问位不足会给出具体的 required/granted 错误，权限查询失败也不会被当作注入成功。日志新增 `desktopAccess` 和 `stationAccess`，记录线程桌面及窗口站句柄实际授予的权限。此处使用的是桌面访问位，不安装 journal 钩子。[桌面访问权限](https://learn.microsoft.com/en-us/windows/win32/winstation/desktop-security-and-access-rights)、[NtQueryObject 的 GrantedAccess](https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntqueryobject)。原 MSDN 作者也记录过同类 LocalSystem/Winlogon 注入失败及补齐该访问位的处理，见 [原文归档镜像](https://www.sysadmins.lv/retired-msft-blogs/alejacma/sendinput-doesnt-work-but-it-doesnt-return-an-error.aspx)。
@@ -57,7 +63,7 @@ $probe.ExitCode
 
 诊断命令：`Get-Service MwbRustInput`。代理启动或通信错误记录在安装目录的 `input-service.log`，最大约 1 MiB；不记录键值、密码、配对密钥或剪贴板内容。若在锁屏状态遇到服务故障，先用被控端本地键鼠解锁，修复服务后重新开启共享。
 
-若连接记录提示“请使用安装目录中的 MWB 程序”或安装目录不一致，关闭当前主程序，再打开已安装的 `mwb.exe` 并重新连接。更新 v0.5.5 时必须重新执行安装脚本，更换**主程序和输入服务**；只运行开发目录的新 exe 或只替换主程序不会更新服务启动路径。若仍遇到 `SendInput 返回 0/1`，记录完整错误链及服务日志：错误中的“会话输入代理在当前桌面定位/注入失败”表示已到达服务输入阶段；“普通桌面定位/输入未插入事件”表示普通输入被拒绝后迁移服务也失败。错误码 0 仅表示系统没有提供更多信息，不能据此判断注入成功或确定是 UIPI。[SendInput 返回值与限制](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)。输入失败会暂停共享，需先在本地解锁、修复并恢复共享。
+若连接记录提示“请使用安装目录中的 MWB 程序”或安装目录不一致，关闭当前主程序，再打开已安装的 `mwb.exe` 并重新连接。更新 v0.5.6 时请重新执行安装脚本，更换**主程序和输入服务**，再从安装目录运行。若仍遇到 `SendInput 返回 0/1`，记录完整错误链及服务日志：错误中的“会话输入代理在当前桌面定位/注入失败”表示已到达服务输入阶段；“普通桌面定位/输入未插入事件”表示普通输入被拒绝后迁移服务也失败。错误码 0 仅表示系统没有提供更多信息，不能据此判断注入成功或确定是 UIPI。[SendInput 返回值与限制](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)。输入失败会暂停共享，需先在本地解锁、修复并恢复共享。
 
 复现失败后，可在被控端解锁并读取最后的诊断记录：
 
@@ -65,12 +71,12 @@ $probe.ExitCode
 Get-Content -LiteralPath (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'MWB-Rust\input-service.log') -Tail 20
 ```
 
-代理启动记录应包含 `agent=0.5.5`、`system=true`、`integrity=0x4000`（或更高）、`uiAccess=true`；令牌会话号应与控制台一致。失败记录同时带有 `threadDesktop`、`inputDesktop`、`desktopAccess` 和 `stationAccess`。附加后 `desktopAccess` 应包含 `0x1a9` 的全部访问位；若为 `0x189`，仍缺少本次修正的 `0x20`。启动时尚未锁屏，输入桌面显示 `Default` 是正常的，应以失败时的快照为准。日志不记录键值、鼠标位置、PIN 或配对密钥。
+代理启动记录应包含 `agent=0.5.6`、`system=true`、`integrity=0x4000`（或更高）、`uiAccess=true`；令牌会话号应与控制台一致。本地输入协议未变化，v0.5.5 服务也能被新版主程序使用，但建议通过脚本配套更新。失败记录同时带有 `threadDesktop`、`inputDesktop`、`desktopAccess` 和 `stationAccess`。附加后 `desktopAccess` 应包含 `0x1a9` 的全部访问位；若为 `0x189`，仍缺少已修正的 `0x20`。启动时尚未锁屏，输入桌面显示 `Default` 是正常的，应以失败时的快照为准。日志不记录键值、鼠标位置、PIN 或配对密钥。
 
 ## 输入与故障处理
 
-- 普通桌面优先直接注入，成功时不连接可选服务。切入时已锁屏、控制期间桌面变为不可访问，或普通 `SendInput` 明确返回 0 时，才连接本会话服务并迁移鼠标模式与位置。桌面处于活动状态不代表普通进程有注入权限；服务未安装仍可正常控制允许直接注入的普通桌面。
-- 控制一旦迁入服务，该次会话保持服务输入直到释放。服务已连接后发生故障会结束当前控制，不会把尚未确认的按键重发到普通桌面。再次从普通桌面切入时重新选择本地输入。
+- 安装版优先使用经身份校验的输入服务，以支持普通桌面、管理员窗口与锁屏界面。服务不存在或握手失败时，允许直接注入的普通桌面仍正常工作。切入时已锁屏，或普通输入过程中桌面不可访问、注入明确返回 0 时，仍会按原规则要求服务。
+- 输入后端在每次切入时选择，使用服务的会话保持服务输入直到释放。服务实际定位/输入后发生故障会结束当前控制，不会把尚未确认的事件重发到普通桌面；普通输入会话也不会仅因服务恢复而在按住键鼠时切换后端，下次切入重新选择。
 - 接收端每约 8 ms 查询一次输入状态，兼顾光标反馈、服务保活和本地接管；比例模式也参与检查。桌面变化时释放旧按键，恢复鼠标模式与位置，不把旧的按下状态带入登录界面。
 - 代理中的首次定位、切换后的定位和后续输入遇到桌面竞争时，仅在 `SendInput` 确认未插入且桌面确实变化后重试一次。桌面未变时报告原错误，未知结果和成功插入的键盘事件均不重放；成功输入也不会因后续光标读取失败而重放。
 - 单次本地 I/O 等待上限为 750 ms；代理在 1.5 秒没有收到下一条命令时关闭输入会话并释放按键。窗口退出、管道断开、服务停止、非法消息或超时均触发释放。停止服务先等待代理正常退出，任务对象提供异常退出后的进程清理。
@@ -90,6 +96,8 @@ Get-Content -LiteralPath (Join-Path ([Environment]::GetFolderPath('ProgramFiles'
 
 ## 验收状态
 
+v0.5.6 常规核心测试 **103 项通过，0 失败，5 项默认跳过**，并通过格式检查和全部目标的严格 lint。本次新增 4 项回归，覆盖服务优先处理首次按下/释放及后续移动/滚轮/按键、握手失败的普通桌面降级、服务 Enter 失败不重放，以及服务恢复后在新会话重新选择。未在本机安装服务或操作真实管理员 PowerShell 窗口；用户报告的管理员窗口场景仍需复测。
+
 自动测试使用替代输入后端验证锁屏/解锁状态切换、模式保留、按键释放、桌面切换竞争、本地接管、服务断开后连接保留和重新开启共享。另测试真实 Windows 命名管道的超时取消/收发、对端身份约束和协议拒绝；不在测试机器上真实锁屏或注入输入。
 
 v0.5.3 新增回归覆盖活动桌面拒绝输入（错误码 0/5）后的迁移、首次定位竞争、持续切换时重试上限、未知/非零插入结果不重放，以及成功解锁按键后立即切换桌面不重复输入。令牌复制和 Winlogon 桌面启动需在安装后的 LocalSystem 服务中实测，单元测试不能代替这部分验收。
@@ -104,7 +112,7 @@ cargo test --no-default-features --lib --locked attached_desktop_access_controls
 
 该测试仅在已解锁交互桌面运行；创建不可见测试桌面以隔离缓存的附加权限，直接/重新附加时以新掩码成功注入零位移，旧掩码稳定返回 0/5。它不等同于真实 Winlogon/PIN 验收。
 
-**尚未完成两台实体电脑的锁屏登录验收。** 部署后需分别验证：被控端先锁屏再切入；远控过程中锁屏；密码/PIN 解锁后继续移动；两种鼠标模式；本地键鼠接管；按住按键时退出主程序或停止服务；卸载后普通桌面控制。测试结束确认没有按键或鼠标按钮残留。
+**用户已确认 v0.5.5 的 PIN 输入界面恢复正常。** 尚需完整验收：被控端先锁屏再切入、远控过程中锁屏、解锁后继续移动、两种鼠标模式、本地键鼠接管、退出/停止服务后的按键释放，以及 v0.5.6 在管理员 PowerShell、普通窗口和任务栏之间连续切换。测试结束确认没有按键或鼠标按钮残留。
 
 ## 卸载
 

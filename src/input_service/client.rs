@@ -20,6 +20,18 @@ pub(crate) struct Client {
 }
 
 impl Client {
+    /// Try a service only for the installed client. Portable/development copies
+    /// must not open the privileged pipe on every ordinary desktop entry.
+    pub fn connect_installed() -> Result<Option<Self>> {
+        let Some(installed) = identity::installed_client_path()? else {
+            return Ok(None);
+        };
+        if !identity::same_image(&std::env::current_exe()?, &installed)? {
+            return Ok(None);
+        }
+        Self::connect()
+    }
+
     pub fn connect() -> Result<Option<Self>> {
         let session = identity::current_session().context("读取当前 Windows 会话")?;
         let Some(pipe) = Pipe::open(&pipe_name(session)).context("打开输入服务管道")?
