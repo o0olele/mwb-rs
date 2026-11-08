@@ -422,6 +422,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_client_cannot_handshake_with_ui_access_worker() {
+        let mut session = Session::new(Fake::default());
+        let error = session
+            .handle(Request {
+                version: 1,
+                sequence: 1,
+                command: Command::Hello,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("重新安装"));
+        assert!(!session.ready);
+        assert_eq!(session.backend.enter_attempts, 0);
+        assert_eq!(session.backend.apply_attempts, 0);
+    }
+
+    #[test]
     fn protocol_rejects_input_before_enter_and_replayed_sequences() {
         let mut session = Session::new(Fake::default());
         assert!(

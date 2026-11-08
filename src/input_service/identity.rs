@@ -18,6 +18,7 @@ use windows::{
             Pipes::{GetNamedPipeServerProcessId, GetNamedPipeServerSessionId},
             RemoteDesktop::{ProcessIdToSessionId, WTSQueryUserToken},
             Services::*,
+            SystemServices::SECURITY_MANDATORY_SYSTEM_RID,
             Threading::*,
         },
         UI::Shell::CommandLineToArgvW,
@@ -336,6 +337,70 @@ pub(super) fn is_system(process: HANDLE) -> Result<bool> {
     Ok(unsafe { IsWellKnownSid(user.User.Sid, WinLocalSystemSid).as_bool() })
 }
 
+#[derive(Debug)]
+pub(super) struct InputTokenInfo {
+    pub system: bool,
+    pub session: u32,
+    pub integrity: u32,
+    pub ui_access: bool,
+}
+
+impl InputTokenInfo {
+    pub fn validate_worker(&self, session: u32) -> Result<()> {
+        ensure!(self.system, "输入代理必须使用 SYSTEM 身份");
+        ensure!(
+            self.session == session && session != 0,
+            "输入代理令牌会话不匹配"
+        );
+        ensure!(
+            self.integrity >= SECURITY_MANDATORY_SYSTEM_RID as u32,
+            "输入代理令牌完整性级别不足"
+        );
+        ensure!(
+            self.ui_access,
+            "输入代理令牌缺少 UIAccess，请更新并重启输入服务"
+        );
+        Ok(())
+    }
+}
+
+fn token_u32(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<u32> {
+    let mut value = 0u32;
+    let mut length = 0;
+    unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            Some((&mut value as *mut u32).cast()),
+            size_of::<u32>() as u32,
+            &mut length,
+        )?;
+    }
+    ensure!(length as usize == size_of::<u32>(), "令牌信息长度无效");
+    Ok(value)
+}
+
+/// Read only non-secret process attributes. Never include logon/account SIDs,
+/// credentials or input payloads in the service diagnostic snapshot.
+pub(super) fn input_token_info(token: HANDLE) -> Result<InputTokenInfo> {
+    let user_data = token_data(token, TokenUser)?;
+    let user = unsafe { &*user_data.as_ptr().cast::<TOKEN_USER>() };
+    let label_data = token_data(token, TokenIntegrityLevel)?;
+    let label = unsafe { &*label_data.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+    ensure!(
+        unsafe { IsValidSid(label.Label.Sid).as_bool() },
+        "令牌完整性 SID 无效"
+    );
+    let count = unsafe { *GetSidSubAuthorityCount(label.Label.Sid) };
+    ensure!(count > 0, "令牌完整性 SID 为空");
+    Ok(InputTokenInfo {
+        system: unsafe { IsWellKnownSid(user.User.Sid, WinLocalSystemSid).as_bool() },
+        session: token_u32(token, TokenSessionId)?,
+        integrity: unsafe { *GetSidSubAuthority(label.Label.Sid, u32::from(count - 1)) },
+        ui_access: token_u32(token, TokenUIAccess)? != 0,
+    })
+}
+
 pub(super) fn logon_sid(token: HANDLE) -> Result<String> {
     let data = token_data(token, TokenGroups)?;
     let groups = unsafe { &*data.as_ptr().cast::<TOKEN_GROUPS>() };
@@ -447,6 +512,50 @@ pub(super) fn verify_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_token_snapshot_matches_real_process_identity_and_session() {
+        let process = unsafe { GetCurrentProcess() };
+        let token = process_token(process).unwrap();
+        let info = input_token_info(token.0).unwrap();
+        assert_eq!(info.system, is_system(process).unwrap());
+        assert_eq!(info.session, current_session().unwrap());
+        assert!(info.integrity > 0);
+        assert_eq!(
+            info.ui_access,
+            token_u32(token.0, TokenUIAccess).unwrap() != 0
+        );
+    }
+
+    #[test]
+    fn input_worker_requires_system_session_integrity_and_ui_access_together() {
+        let valid = || InputTokenInfo {
+            system: true,
+            session: 1,
+            integrity: SECURITY_MANDATORY_SYSTEM_RID as u32,
+            ui_access: true,
+        };
+        valid().validate_worker(1).unwrap();
+        let mut legacy = valid();
+        legacy.ui_access = false;
+        assert!(
+            legacy
+                .validate_worker(1)
+                .unwrap_err()
+                .to_string()
+                .contains("UIAccess")
+        );
+        let mut user = valid();
+        user.system = false;
+        assert!(user.validate_worker(1).is_err());
+        let mut low = valid();
+        low.integrity -= 1;
+        assert!(low.validate_worker(1).is_err());
+        assert!(valid().validate_worker(2).is_err());
+        let mut service = valid();
+        service.session = 0;
+        assert!(service.validate_worker(0).is_err());
+    }
 
     #[test]
     fn service_commands_accept_windows_quoting_but_reject_other_entrypoints() {

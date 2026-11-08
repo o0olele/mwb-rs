@@ -36,8 +36,12 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static STATUS: AtomicUsize = AtomicUsize::new(0);
 
 fn log(error: &anyhow::Error) {
+    record(&format!("{error:#}"));
+}
+
+fn record(message: &str) {
     // Never log input packets, key values, credentials or clipboard contents.
-    eprintln!("{error:#}");
+    eprintln!("{message}");
     if let Ok(path) = identity::sibling("input-service.log") {
         // Bound the diagnostic file. Only SYSTEM/admin can write in this folder.
         let append = std::fs::metadata(&path).is_ok_and(|m| m.len() < 1024 * 1024);
@@ -52,7 +56,7 @@ fn log(error: &anyhow::Error) {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let _ = writeln!(file, "{now}: {error:#}");
+            let _ = writeln!(file, "{now}: {message}");
         }
     }
 }
@@ -233,7 +237,7 @@ fn session_input_token(session: u32) -> Result<Handle> {
                 unsafe {
                     DuplicateTokenEx(
                         source.0,
-                        TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
+                        TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
                         None,
                         SecurityImpersonation,
                         TokenPrimary,
@@ -241,7 +245,23 @@ fn session_input_token(session: u32) -> Result<Handle> {
                     )
                     .context("创建会话输入代理令牌")?;
                 }
-                return Ok(Handle(token));
+                let token = Handle(token);
+                // UIAccess is a separate token attribute from SYSTEM identity
+                // and integrity. Set it on the new primary token before launch,
+                // using the supervisor's enabled SeTcbPrivilege. Never modify
+                // the Winlogon token itself or grant this token to the client.
+                let ui_access = 1u32;
+                unsafe {
+                    SetTokenInformation(
+                        token.0,
+                        TokenUIAccess,
+                        (&ui_access as *const u32).cast(),
+                        size_of::<u32>() as u32,
+                    )
+                    .context("为输入代理令牌启用 UIAccess")?;
+                }
+                identity::input_token_info(token.0)?.validate_worker(session)?;
+                return Ok(token);
             }
         }
         if unsafe { Process32NextW(snapshot.0, &mut entry) }.is_err() {
@@ -400,6 +420,8 @@ fn worker(session: u32, parent: u32, stop_name: &str) -> Result<()> {
         identity::current_session()? == session && session != 0,
         "输入代理会话无效"
     );
+    let token = identity::process_token(unsafe { GetCurrentProcess() })?;
+    identity::input_token_info(token.0)?.validate_worker(session)?;
     let service = identity::verify_peer(parent, 0, &std::env::current_exe()?, true, None)?;
     let stop_name = pipe::wide(stop_name);
     let stop = Handle(unsafe {
@@ -412,6 +434,10 @@ fn worker(session: u32, parent: u32, stop_name: &str) -> Result<()> {
     let user = identity::session_user(session)?;
     identity::allow_worker_verification(&user)?;
     let pipe = Pipe::create(&pipe_name(session), &user)?;
+    record(&format!(
+        "input worker ready [{}]",
+        super::desktop::diagnostics()
+    ));
     let stopping = || unsafe {
         WaitForSingleObject(stop.0, 0) != WAIT_TIMEOUT
             || WaitForSingleObject(service.0, 0) != WAIT_TIMEOUT
@@ -454,7 +480,12 @@ fn worker(session: u32, parent: u32, stop_name: &str) -> Result<()> {
                 let failed = result.is_err();
                 let reply = match result {
                     Ok(reply) => reply,
-                    Err(error) => Reply::Error(format!("{error:#}")),
+                    Err(error) => {
+                        // Input failures are returned as a reply rather than an
+                        // outer I/O error, so record them here before teardown.
+                        log(&error);
+                        Reply::Error(format!("{error:#}"))
+                    }
                 };
                 pipe.send(&Response {
                     version: VERSION,

@@ -48,10 +48,7 @@ impl Client {
                 command,
             })?;
             let response: Response = self.pipe.receive(TIMEOUT)?;
-            ensure!(
-                response.version == VERSION && response.sequence == self.sequence,
-                "锁屏输入服务响应不匹配"
-            );
+            response.validate(self.sequence)?;
             match response.result {
                 Reply::Error(error) => anyhow::bail!("{error}"),
                 reply => Ok(reply),
