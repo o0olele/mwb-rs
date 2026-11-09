@@ -6,6 +6,7 @@ pub mod input_service;
 pub mod layout;
 mod motion;
 mod network;
+pub mod pairing;
 pub mod platform;
 pub mod protocol;
 pub mod switching;

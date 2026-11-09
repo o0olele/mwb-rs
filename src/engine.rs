@@ -27,6 +27,9 @@ pub struct Status {
     pub listening: bool,
     pub connected: bool,
     pub reconnecting: bool,
+    /// This run has listened successfully or been admitted by the hub.
+    /// Kept across transient disconnects so the UI can remember short sessions.
+    pub established: bool,
     pub peer_name: String,
     pub address: String,
     pub detail: String,
@@ -358,6 +361,7 @@ fn start_with_input(
     rt.stop.store(false, Ordering::SeqCst);
     rt.paused.store(false, Ordering::SeqCst);
     rt.emergency.store(false, Ordering::SeqCst);
+    rt.status.lock().unwrap().established = false;
     let (tx, rx) = mpsc::sync_channel(4096);
     let (etx, erx) = mpsc::sync_channel(4096);
     let host = target.is_none();
@@ -380,7 +384,11 @@ fn start_with_input(
         }
     };
     *rt.commands.lock().unwrap() = Some(tx);
-    rt.status.lock().unwrap().host = host;
+    {
+        let mut status = rt.status.lock().unwrap();
+        status.host = host;
+        status.established = host;
+    }
     rt.log(if host {
         "工作组已创建，等待其他设备加入"
     } else {
@@ -467,6 +475,7 @@ fn start_with_input(
             s.connected = false;
             s.listening = false;
             s.reconnecting = false;
+            s.established = false;
             s.control = None;
             for d in &mut s.layout.devices {
                 d.online = d.info.id == rt.local.id;
@@ -950,6 +959,7 @@ impl Group {
                 self.layout = layout;
                 self.revision = revision;
                 self.publish();
+                self.rt.status.lock().unwrap().established = true;
             }
             Message::Control(c) => {
                 if let Err(e) = self.apply_control(c, input) {

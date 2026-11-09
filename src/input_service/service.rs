@@ -64,6 +64,9 @@ fn record(message: &str) {
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
+        [flag, client] if flag == "--check-installation" => {
+            super::installation::check(std::path::Path::new(client))
+        }
         [flag] if flag == "--service" => {
             let name = pipe::wide(SERVICE_NAME);
             let entries = [
@@ -85,7 +88,7 @@ pub fn run() -> Result<()> {
             }
             result
         }
-        _ => bail!("请使用 scripts/input-service.ps1 安装或卸载服务；此程序不直接启动界面"),
+        _ => bail!("请运行 MWB 安装包安装或卸载；开发环境也可使用 scripts/input-service.ps1"),
     }
 }
 

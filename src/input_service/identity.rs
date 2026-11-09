@@ -144,7 +144,7 @@ fn service_command_image(command: &str) -> Result<PathBuf> {
     result
 }
 
-fn registered_service() -> Result<Option<RegisteredService>> {
+fn registered_service_config() -> Result<Option<RegisteredService>> {
     let manager = ServiceHandle(unsafe {
         OpenSCManagerW(None, None, SC_MANAGER_CONNECT).context("连接本机服务管理器（只读）")?
     });
@@ -185,20 +185,34 @@ fn registered_service() -> Result<Option<RegisteredService>> {
         "输入服务未使用 LocalSystem 账户"
     );
     let command = unsafe { config.lpBinaryPathName.to_string()? };
-    let image = service_command_image(&command)?
+    let image = service_command_image(&command)?;
+    Ok(Some(RegisteredService {
+        handle: service,
+        image,
+    }))
+}
+
+pub(super) fn installation_service_image() -> Result<Option<PathBuf>> {
+    Ok(registered_service_config()?.map(|service| service.image))
+}
+
+fn registered_service() -> Result<Option<RegisteredService>> {
+    let Some(mut service) = registered_service_config()? else {
+        return Ok(None);
+    };
+    service.image = service
+        .image
         .canonicalize()
         .context("解析输入服务安装路径")?;
     ensure!(
-        image
+        service
+            .image
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.eq_ignore_ascii_case(super::SERVICE_EXE)),
         "输入服务程序名称不匹配"
     );
-    Ok(Some(RegisteredService {
-        handle: service,
-        image,
-    }))
+    Ok(Some(service))
 }
 
 fn installed_client(service: &RegisteredService) -> Result<PathBuf> {

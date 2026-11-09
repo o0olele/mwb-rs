@@ -66,6 +66,17 @@ $operation = if ($Action -eq 'Install') {
 }
 if (-not $PSCmdlet.ShouldProcess($installDirectory, $operation)) { return }
 
+$registryMachine = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+    [Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+try {
+    $installerMarker = $registryMachine.OpenSubKey('SOFTWARE\MWB-Rust\Installer')
+    try {
+        if ($installerMarker -and $installerMarker.GetValue('Directory')) {
+            throw 'This installation is managed by Windows Installer. Use the MSI package to update/repair, or Windows Settings to uninstall.'
+        }
+    } finally { if ($installerMarker) { $installerMarker.Dispose() } }
+} finally { $registryMachine.Dispose() }
+
 $installerIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 try {
     $installerPrincipal = [Security.Principal.WindowsPrincipal]::new($installerIdentity)

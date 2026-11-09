@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="MWB Rust" Language="2052" Codepage="936"
+           Version="$(var.Version)" Manufacturer="MWB Rust"
+           UpgradeCode="E5428861-673A-4C1D-B662-28CFB28B4545">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             InstallPrivileges="elevated" Platform="x64" SummaryCodepage="936" Description="MWB Rust 键鼠共享" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="已安装较新的 MWB Rust，请使用相同或更新版本的安装包。" />
+    <Property Id="WINDOWS_BUILD">
+      <RegistrySearch Id="SearchWindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentBuildNumber" Type="raw" Win64="yes" />
+    </Property>
+    <Condition Message="MWB Rust 需要 64 位 Windows 10 或更新版本。">Installed OR (VersionNT64 AND WINDOWS_BUILD &gt;= 10240)</Condition>
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="MWB-Rust">
+          <Component Id="InstallDirectory" Guid="52C2577A-07C0-448E-80A2-F5D9337DF7D7" Win64="yes">
+            <CreateFolder>
+              <PermissionEx Sddl="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+            </CreateFolder>
+            <RegistryValue Root="HKLM" Key="Software\MWB-Rust\Installer" Name="Directory"
+                           Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+          </Component>
+          <Component Id="MainApplication" Guid="7160D6E3-36F0-4AE3-B784-370A82D10612" Win64="yes">
+            <File Id="MainExecutable" Source="$(var.BuildDirectory)\mwb.exe" KeyPath="yes">
+              <PermissionEx Sddl="O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+              <Shortcut Id="StartMenuShortcut" Directory="ApplicationProgramsFolder" Name="MWB Rust"
+                        Advertise="yes" WorkingDirectory="INSTALLFOLDER" />
+              <Shortcut Id="DesktopShortcut" Directory="DesktopFolder" Name="MWB Rust"
+                        Advertise="yes" WorkingDirectory="INSTALLFOLDER" />
+            </File>
+            <RemoveFolder Id="RemoveApplicationMenu" Directory="ApplicationProgramsFolder" On="uninstall" />
+          </Component>
+          <Component Id="InputService" Guid="F70FC8BA-8B66-45D2-93BB-C819C0C0CA15" Win64="yes">
+            <File Id="ServiceExecutable" Source="$(var.BuildDirectory)\mwb-input-service.exe" KeyPath="yes">
+              <PermissionEx Sddl="O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+            </File>
+            <ServiceInstall Id="InstallInputService" Name="MwbRustInput" DisplayName="MWB Rust Lock Screen Input"
+                            Description="Receives authenticated MWB input in the active console session."
+                            Arguments="--service" Type="ownProcess" Start="auto" ErrorControl="normal" Vital="yes" />
+            <ServiceControl Id="ControlInputService" Name="MwbRustInput" Start="install" Stop="both"
+                            Remove="both" Wait="yes" />
+            <RemoveFile Id="RemoveServiceLog" Name="input-service.log" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="MWB Rust" />
+      </Directory>
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <Feature Id="Complete" Title="MWB Rust" Level="1" Absent="disallow">
+      <ComponentRef Id="InstallDirectory" />
+      <ComponentRef Id="MainApplication" />
+      <ComponentRef Id="InputService" />
+    </Feature>
+
+    <!-- The embedded checker is read-only and runs before any system changes. -->
+    <Binary Id="SetupChecker" SourceFile="$(var.BuildDirectory)\mwb-input-service.exe" />
+    <CustomAction Id="CheckInstallation" BinaryKey="SetupChecker"
+                  ExeCommand="--check-installation &quot;[INSTALLFOLDER]mwb.exe&quot;"
+                  Execute="immediate" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="CheckInstallation" Before="InstallInitialize">NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+
+    <!-- This is a client UI action, so the app keeps the original user's profile. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="打开 MWB Rust" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="以后可从桌面打开 MWB。成功配对后，再次打开会自动连接。" />
+    <Property Id="WixShellExecTarget" Value="[#MainExecutable]" />
+    <CustomAction Id="LaunchApplication" BinaryKey="WixCA" DllEntry="WixShellExec" Impersonate="yes" />
+
+    <UI>
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Microsoft YaHei UI" Size="9" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Microsoft YaHei UI" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Microsoft YaHei UI" Size="10" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="ExitDialog" />
+
+      <Dialog Id="MwbWelcomeDlg" Width="370" Height="270" Title="MWB Rust 安装">
+        <Control Id="Title" Type="Text" X="24" Y="24" Width="322" Height="26"
+                 Text="{\WixUI_Font_Bigger}安装 MWB Rust" />
+        <Control Id="Description" Type="Text" X="24" Y="64" Width="322" Height="28"
+                 Text="一次安装即可完成键鼠共享所需组件。" />
+        <Control Id="Features" Type="Text" X="24" Y="103" Width="322" Height="62"
+                 Text="主程序与输入服务，支持锁屏和管理员窗口操作&#13;&#10;桌面和开始菜单快捷方式&#13;&#10;更新时保留配对与屏幕布局" />
+        <Control Id="Location" Type="Text" X="24" Y="184" Width="322" Height="32"
+                 Text="安装位置：[INSTALLFOLDER]" />
+        <Control Id="Line" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Install" Type="PushButton" X="192" Y="243" Width="82" Height="18" Default="yes"
+                 ElevationShield="yes" Text="安装(&amp;I)">
+          <Publish Event="EndDialog" Value="Return">1</Publish>
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="284" Y="243" Width="62" Height="18" Cancel="yes" Text="取消">
+          <Publish Event="EndDialog" Value="Exit">1</Publish>
+        </Control>
+      </Dialog>
+
+      <Dialog Id="MwbMaintenanceDlg" Width="370" Height="270" Title="MWB Rust 维护">
+        <Control Id="Title" Type="Text" X="24" Y="24" Width="322" Height="26"
+                 Text="{\WixUI_Font_Bigger}MWB Rust 已安装" />
+        <Control Id="Description" Type="Text" X="24" Y="76" Width="322" Height="62"
+                 Text="可修复程序和输入服务，或卸载 MWB Rust。&#13;&#10;配对、屏幕布局和已接收的文件会保留。" />
+        <Control Id="Repair" Type="PushButton" X="24" Y="156" Width="100" Height="22" Default="yes"
+                 ElevationShield="yes" Text="修复(&amp;R)">
+          <Publish Property="REINSTALL" Value="ALL">1</Publish>
+          <Publish Property="REINSTALLMODE" Value="amus">1</Publish>
+          <Publish Event="EndDialog" Value="Return">1</Publish>
+        </Control>
+        <Control Id="Remove" Type="PushButton" X="142" Y="156" Width="100" Height="22"
+                 ElevationShield="yes" Text="卸载(&amp;U)">
+          <Publish Property="REMOVE" Value="ALL">1</Publish>
+          <Publish Event="EndDialog" Value="Return">1</Publish>
+        </Control>
+        <Control Id="Line" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Cancel" Type="PushButton" X="284" Y="243" Width="62" Height="18" Cancel="yes" Text="取消">
+          <Publish Event="EndDialog" Value="Exit">1</Publish>
+        </Control>
+      </Dialog>
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication" Order="1">
+        WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed AND NOT REMOVE
+      </Publish>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
+      <InstallUISequence>
+        <Show Dialog="MwbWelcomeDlg" Before="ProgressDlg">NOT Installed</Show>
+        <Show Dialog="MwbMaintenanceDlg" Before="MwbWelcomeDlg">Installed AND NOT RESUME</Show>
+      </InstallUISequence>
+    </UI>
+    <UIRef Id="WixUI_Common" />
+  </Product>
+</Wix>

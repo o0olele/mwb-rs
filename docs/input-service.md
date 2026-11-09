@@ -32,6 +32,10 @@ Windows 的钩子属于各自的桌面，普通进程不能访问 Winlogon 桌�
 
 ## 安装与更新
 
+普通使用推荐双击 `mwb-v0.5.8-windows-x64.msi`，点击「安装」并确认管理员授权，主程序、服务及快捷方式会自动安装。后续更新运行新 MSI，卸载使用 Windows 设置。旧脚本安装可直接升级为 MSI；MSI 管理的目录不再用脚本安装/卸载。配对、布局和接收文件保留。详见 [安装与更新](install.md)。
+
+以下脚本方式用于开发和未交由 MSI 管理的旧部署：
+
 1. 构建 `cargo build --release --locked`，得到 `mwb.exe`、`mwb-input-service.exe`。
 2. 关闭被控端安装目录中已有的 MWB 窗口，在管理员 PowerShell 中运行：
 
@@ -47,7 +51,7 @@ Windows 的钩子属于各自的桌面，普通进程不能访问 Winlogon 桌�
 4. 从安装目录打开 `mwb.exe`，正常创建或加入工作组。开发目录中的 exe 不被服务信任，必须使用安装后的版本。
 5. 锁定被控端后，从控制端移动鼠标切入；点击登录界面并输入密码或 PIN。使用本地键鼠会接管，之后可再次切入。
 
-更新时关闭安装目录中的主程序，再执行同一安装命令。脚本会停止旧服务、更换两个 exe、重新启动服务。已安装的服务不会替你自动运行主程序或保存密钥。
+更新时关闭安装目录中的主程序，再执行同一安装命令。脚本会停止旧服务、更换两个 exe、重新启动服务。已安装的服务不会替你自动运行主程序或保存密钥；v0.5.7 起主程序在成功配置后加密记住配对，再次打开会自动恢复工作组。
 
 ## 不注入输入的部署检查
 
@@ -71,7 +75,7 @@ $probe.ExitCode
 Get-Content -LiteralPath (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'MWB-Rust\input-service.log') -Tail 20
 ```
 
-代理启动记录应包含 `agent=0.5.6`、`system=true`、`integrity=0x4000`（或更高）、`uiAccess=true`；令牌会话号应与控制台一致。本地输入协议未变化，v0.5.5 服务也能被新版主程序使用，但建议通过脚本配套更新。失败记录同时带有 `threadDesktop`、`inputDesktop`、`desktopAccess` 和 `stationAccess`。附加后 `desktopAccess` 应包含 `0x1a9` 的全部访问位；若为 `0x189`，仍缺少已修正的 `0x20`。启动时尚未锁屏，输入桌面显示 `Default` 是正常的，应以失败时的快照为准。日志不记录键值、鼠标位置、PIN 或配对密钥。
+代理启动记录应包含 `agent=0.5.8`、`system=true`、`integrity=0x4000`（或更高）、`uiAccess=true`；令牌会话号应与控制台一致。本地输入协议未变化，v0.5.5/v0.5.6/v0.5.7 服务也能被新版主程序使用，推荐通过 MSI 配套更新。失败记录同时带有 `threadDesktop`、`inputDesktop`、`desktopAccess` 和 `stationAccess`。附加后 `desktopAccess` 应包含 `0x1a9` 的全部访问位；若为 `0x189`，仍缺少已修正的 `0x20`。启动时尚未锁屏，输入桌面显示 `Default` 是正常的，应以失败时的快照为准。日志不记录键值、鼠标位置、PIN 或配对密钥。
 
 ## 输入与故障处理
 

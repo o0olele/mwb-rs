@@ -14,6 +14,7 @@ use mwb::{
     engine::{self, Runtime},
     exchange::{Phase, format_size},
     layout::{Layout, Point as LayoutPoint},
+    pairing::SavedConnection,
     platform,
     switching::EdgeSwitchCondition,
 };
@@ -56,22 +57,44 @@ struct Workspace {
     input_service_notice: String,
     show_key: bool,
     preparing: bool,
+    start_generation: u64,
+    pending_connection: Option<SavedConnection>,
     _refresh: Task<()>,
 }
 
 impl Workspace {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (config, mut notice) = match Config::load() {
+        let (mut config, mut notice) = match Config::load() {
             Ok(config) => (config, String::new()),
             Err(err) => (Config::default(), format!("{err:#}")),
         };
         if let Err(err) = config.save() {
             notice = format!("保存设备标识失败：{err:#}");
         }
+        let (key, auto_start) = match config.restore_connection() {
+            Ok(Some(saved)) => {
+                config.port = saved.port;
+                if let Some(target) = &saved.target {
+                    config.peer_address = target.clone();
+                }
+                (
+                    saved.secret,
+                    config.auto_connect.then_some(saved.target.is_some()),
+                )
+            }
+            Ok(None) => (
+                new_pairing_key().expect("Windows secure random source unavailable"),
+                None,
+            ),
+            Err(err) => {
+                notice = format!("无法恢复已保存配对，请重新输入密钥并连接：{err:#}");
+                // Keep the saved profile for recovery; never replace it with a random key.
+                (String::new(), None)
+            }
+        };
         let runtime = Runtime::new(&config);
         let layout_draft = runtime.snapshot().layout;
         let selected = config.device_id.clone();
-        let key = new_pairing_key().expect("Windows secure random source unavailable");
         let secret = cx.new(|cx| InputState::new(window, cx).default_value(key).masked(true));
         let key_length = cx.new(|cx| InputState::new(window, cx).default_value("64"));
         let address = cx.new(|cx| {
@@ -95,7 +118,7 @@ impl Workspace {
                 }
             }
         });
-        Self {
+        let mut workspace = Self {
             config,
             runtime,
             secret,
@@ -116,8 +139,14 @@ impl Workspace {
             input_service_notice: mwb::input_service::installation_notice().unwrap_or_default(),
             show_key: false,
             preparing: false,
+            start_generation: 0,
+            pending_connection: None,
             _refresh: refresh,
+        };
+        if let Some(connect) = auto_start {
+            workspace.start(connect, cx);
         }
+        workspace
     }
 
     fn persist(&mut self) {
@@ -149,27 +178,57 @@ impl Workspace {
             return;
         }
         self.preparing = true;
+        self.start_generation = self.start_generation.wrapping_add(1);
+        let generation = self.start_generation;
+        self.pending_connection = None;
         self.notice = "正在准备配对…".into();
         let target = connect.then(|| self.config.peer_address.clone());
+        let saved_target = target.clone();
+        let port = self.config.port;
+        let device_id = self.config.device_id.clone();
         // Custom passphrases use a memory-hard KDF; keep it off the UI thread.
-        let key_task = cx
-            .background_executor()
-            .spawn(async move { parse_pairing_key(&secret) });
+        let key_task = cx.background_executor().spawn(async move {
+            let key = parse_pairing_key(&secret)?;
+            let saved = SavedConnection::new(&secret, saved_target, port, &device_id);
+            Ok::<_, anyhow::Error>((key, saved))
+        });
         cx.spawn(async move |this, cx| {
             let key = key_task.await;
             let _ = this.update(cx, |this, cx| {
+                if this.start_generation != generation {
+                    return;
+                }
                 this.preparing = false;
                 this.notice.clear();
-                match key.and_then(|key| {
-                    engine::start(this.runtime.clone(), this.config.clone(), key, target)
+                match key.and_then(|(key, saved)| {
+                    engine::start(this.runtime.clone(), this.config.clone(), key, target)?;
+                    Ok(saved)
                 }) {
-                    Ok(()) => this.persist(),
+                    Ok(saved) => {
+                        match saved {
+                            Ok(saved) => this.pending_connection = Some(saved),
+                            Err(err) => {
+                                this.notice = format!("连接已启动，但无法保存配对信息：{err:#}");
+                            }
+                        }
+                        this.refresh_layout();
+                    }
                     Err(err) => this.notice = format!("{err:#}"),
                 }
                 cx.notify();
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        self.refresh_layout();
+        self.start_generation = self.start_generation.wrapping_add(1);
+        self.preparing = false;
+        self.pending_connection = None;
+        self.runtime.stop();
+        self.notice = "已停止连接；下次打开仍按启动连接偏好恢复。".into();
         cx.notify();
     }
 
@@ -472,7 +531,11 @@ impl Workspace {
 
     fn refresh_layout(&mut self) {
         let state = self.runtime.snapshot();
-        if self.config.layout != state.layout {
+        let remember = state.established && self.pending_connection.is_some();
+        if remember {
+            self.config.saved_connection = self.pending_connection.take();
+        }
+        if remember || self.config.layout != state.layout {
             self.config.layout = state.layout.clone();
             self.persist();
         }
@@ -1072,6 +1135,19 @@ impl Workspace {
                                             })),
                                     )
                                     .child(
+                                        Button::new("forget-connection")
+                                            .small()
+                                            .ghost()
+                                            .label("忘记配对")
+                                            .disabled(running || self.config.saved_connection.is_none())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.config.saved_connection = None;
+                                                this.pending_connection = None;
+                                                this.persist();
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
                                         Button::new("show-key")
                                             .small()
                                             .ghost()
@@ -1109,7 +1185,7 @@ impl Workspace {
                                     ),
                             )
                             .child(subtle("可直接输入短口令；短密钥更容易被猜中。"))
-                            .child(subtle("密钥仅在本次运行保留，不写入配置。")),
+                            .child(subtle("配对成功后加密保存在本机；可在共享偏好中关闭启动自动连接。")),
                     )
                     .child(div().w(px(1.)).bg(rgb(BORDER)))
                     .child(
@@ -1369,6 +1445,21 @@ impl Workspace {
                     })),
             ))
             .child(option_row(
+                "启动时自动连接",
+                "打开程序时恢复上次工作组；中心端恢复监听，加入端连接原中心。",
+                Button::new("auto-connect-toggle")
+                    .label(if self.config.auto_connect {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.config.auto_connect = !this.config.auto_connect;
+                        this.persist();
+                        cx.notify();
+                    })),
+            ))
+            .child(option_row(
                 "自动重连",
                 "连接失败或中断后，主动连接端逐步延长间隔重试；暂停状态会保留。等待端持续监听。",
                 Button::new("auto-reconnect-toggle")
@@ -1466,13 +1557,14 @@ impl Workspace {
             .child(div().text_sm().child("当前支持：多设备工作组、自由屏幕布局、键鼠共享、自动文本/图片剪贴板、跨设备 Ctrl+V 粘贴文件与不限大小的文件传输。"))
             .child(div().text_sm().child("接收端可选安装锁屏输入服务，允许从其他电脑操作锁屏界面；安装方法见 README。控制端需保持解锁。"))
             .child(div().text_sm().child("后续计划：文件夹传输、断点续传、自动发现与托盘。"))
-            .child(div().text_sm().child("两端均需运行本重写版。首次登录后先打开程序并连接工作组；暂不提供远程 Ctrl+Alt+Delete。"))
+            .child(div().text_sm().child("两端均需运行本重写版。首次配置后，打开程序自动恢复工作组；暂不提供远程 Ctrl+Alt+Delete。"))
             .child(div().text_xs().text_color(rgb(MUTED)).child("Native UI · GPUI Kit 0.8.1  /  Transport · Noise + ChaCha20-Poly1305"))
     }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
+        self.refresh_layout();
         self.runtime.stop();
     }
 }
@@ -1480,7 +1572,7 @@ impl Drop for Workspace {
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.runtime.snapshot();
-        let running = self.runtime.running.load(Ordering::SeqCst);
+        let running = self.runtime.running.load(Ordering::SeqCst) || self.preparing;
         div()
             .h_flex()
             .size_full()
@@ -1604,8 +1696,7 @@ impl Render for Workspace {
                                         el.child(
                                             Button::new("stop").ghost().label("停止连接").on_click(
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.runtime.stop();
-                                                    cx.notify();
+                                                    this.stop(cx);
                                                 }),
                                             ),
                                         )

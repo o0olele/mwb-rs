@@ -3,6 +3,7 @@
 mod client;
 mod desktop;
 mod identity;
+mod installation;
 mod pipe;
 mod service;
 mod session;

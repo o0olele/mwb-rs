@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, ensure};
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -16,6 +20,8 @@ pub struct Config {
     pub keyboard: bool,
     pub relative_mouse: bool,
     pub auto_reconnect: bool,
+    pub auto_connect: bool,
+    pub saved_connection: Option<crate::pairing::SavedConnection>,
     pub block_corners: bool,
     pub auto_clipboard: bool,
     pub transfer_rate_mib: u32,
@@ -35,6 +41,8 @@ impl Default for Config {
             keyboard: true,
             relative_mouse: false,
             auto_reconnect: true,
+            auto_connect: true,
+            saved_connection: None,
             block_corners: false,
             auto_clipboard: true,
             transfer_rate_mib: 8,
@@ -70,10 +78,34 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    fn save_to(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path.parent().context("配置目录无效")?)?;
-        fs::write(path, serde_json::to_vec_pretty(self)?)?;
-        Ok(())
+        let temporary = path.with_extension(format!("{}.tmp", new_device_id()));
+        let result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&serde_json::to_vec_pretty(self)?)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, path).context("替换配置文件失败")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    pub fn restore_connection(&self) -> Result<Option<crate::pairing::RestoredConnection>> {
+        self.saved_connection
+            .as_ref()
+            .map(|saved| saved.restore(&self.device_id))
+            .transpose()
     }
 }
 
@@ -161,6 +193,9 @@ mod tests {
         assert!(!config.relative_mouse);
         assert!(!config.keyboard);
         assert!(config.auto_reconnect);
+        assert!(config.auto_connect);
+        assert!(config.saved_connection.is_none());
+        assert!(config.restore_connection().unwrap().is_none());
         assert!(!config.block_corners);
         assert_eq!(
             config.edge_switch_condition,
@@ -252,5 +287,90 @@ mod tests {
             parse_pairing_key("1234").unwrap(),
             parse_pairing_key("1235").unwrap()
         );
+    }
+
+    #[test]
+    fn settings_are_replaced_atomically_and_failed_save_keeps_previous_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut config = Config::default();
+        config.save_to(&path).unwrap();
+        config.auto_connect = false;
+        config.save_to(&path).unwrap();
+        let restored: Config = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(!restored.auto_connect);
+        assert_eq!(restored.device_id, config.device_id);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // An in-use destination must retain its previous complete contents.
+            let locked = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap();
+            config.auto_connect = true;
+            assert!(config.save_to(&path).is_err());
+            drop(locked);
+            let unchanged: Config = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert!(!unchanged.auto_connect);
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+
+        // A directory at the destination forces replacement to fail.
+        let blocked = directory.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        assert!(config.save_to(&blocked).is_err());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+        let unchanged: Config = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(unchanged.device_id, config.device_id);
+        assert!(!unchanged.auto_connect);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saved_pairing_opt_out_replacement_and_forgetting_survive_restart() {
+        use crate::pairing::SavedConnection;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut config = Config::default();
+        config.saved_connection = Some(
+            SavedConnection::new(
+                "home-secret",
+                Some("hub.local".into()),
+                24811,
+                &config.device_id,
+            )
+            .unwrap(),
+        );
+        config.auto_connect = false;
+        config.save_to(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("home-secret"));
+        let mut restored: Config = serde_json::from_slice(&bytes).unwrap();
+        assert!(!restored.auto_connect);
+        let saved = restored.restore_connection().unwrap().unwrap();
+        assert_eq!(saved.secret, "home-secret");
+        assert_eq!(saved.target.as_deref(), Some("hub.local"));
+        assert_eq!(saved.port, 24811);
+
+        restored.saved_connection =
+            Some(SavedConnection::new("new-secret", None, 24812, &restored.device_id).unwrap());
+        restored.auto_connect = true;
+        restored.save_to(&path).unwrap();
+        let mut reopened: Config = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(reopened.auto_connect);
+        let saved = reopened.restore_connection().unwrap().unwrap();
+        assert_eq!(saved.secret, "new-secret");
+        assert!(saved.target.is_none());
+        assert_eq!(saved.port, 24812);
+
+        reopened.saved_connection = None;
+        reopened.save_to(&path).unwrap();
+        let forgotten: Config = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(forgotten.restore_connection().unwrap().is_none());
+        assert!(!String::from_utf8_lossy(&fs::read(&path).unwrap()).contains("dpapi-user-v1:"));
     }
 }

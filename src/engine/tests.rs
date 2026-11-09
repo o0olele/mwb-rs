@@ -715,6 +715,7 @@ fn reconnect_keeps_paused_intent_and_resumes_normal_sessions() {
         }
         c.nodes[1].enqueue(Command::DropLinks);
         wait(|| !c.nodes[1].snapshot().connected);
+        assert!(c.nodes[1].snapshot().established);
         wait(|| c.nodes[1].snapshot().connected);
         wait(|| {
             c.nodes[1]
@@ -882,6 +883,129 @@ fn occupied_port_is_reported_before_host_claims_started() {
     );
     assert!(!rt.running.load(Ordering::SeqCst));
     assert!(!rt.snapshot().listening);
+    assert!(!rt.snapshot().established);
+}
+
+#[cfg(windows)]
+#[test]
+fn saved_profiles_restore_after_restart_even_when_member_starts_before_hub() {
+    use crate::pairing::SavedConnection;
+    let mut c = Cluster::new(2);
+    let mut positions = c.nodes[0].snapshot().layout.placements();
+    positions[1].y = 537;
+    c.arrange(0, positions.clone());
+    let port = c.nodes[0]
+        .snapshot()
+        .address
+        .parse::<std::net::SocketAddr>()
+        .unwrap()
+        .port();
+    let directory = tempfile::tempdir().unwrap();
+    let secret = hex::encode([23; 32]);
+    let infos: Vec<_> = c.nodes.iter().map(|node| node.local.clone()).collect();
+    for (index, config) in c.configs.iter_mut().enumerate() {
+        config.port = port;
+        config.layout = c.nodes[index].snapshot().layout;
+        config.saved_connection = Some(
+            SavedConnection::new(
+                &secret,
+                (index > 0).then(|| c.address.clone()),
+                port,
+                &config.device_id,
+            )
+            .unwrap(),
+        );
+        std::fs::write(
+            directory.path().join(format!("{index}.json")),
+            serde_json::to_vec(config).unwrap(),
+        )
+        .unwrap();
+    }
+    for node in &c.nodes {
+        node.stop();
+    }
+    wait(|| {
+        c.nodes
+            .iter()
+            .all(|node| !node.running.load(Ordering::SeqCst))
+    });
+    assert!(c.nodes.iter().all(|node| !node.snapshot().established));
+
+    for (index, info) in infos.into_iter().enumerate() {
+        let config: Config = serde_json::from_slice(
+            &std::fs::read(directory.path().join(format!("{index}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert!(config.auto_connect);
+        c.nodes[index] = Runtime::with_info(&config, info);
+        c.configs[index] = config;
+        c.probes[index] = Arc::new(Probe::default());
+    }
+    // Restore only from disk credentials, including both roles and the hub port.
+    for index in [1, 0] {
+        let saved = c.configs[index].restore_connection().unwrap().unwrap();
+        assert_eq!(saved.port, port);
+        start_with_input(
+            c.nodes[index].clone(),
+            c.configs[index].clone(),
+            crate::config::parse_pairing_key(&saved.secret).unwrap(),
+            saved.target,
+            FakeInput {
+                probe: c.probes[index].clone(),
+                bounds: c.nodes[index].local.bounds,
+                mode: None,
+            },
+        )
+        .unwrap();
+        if index == 1 {
+            wait(|| c.nodes[1].snapshot().reconnecting);
+            assert!(!c.nodes[1].snapshot().established);
+        }
+    }
+    wait(|| {
+        c.nodes.iter().all(|node| {
+            node.snapshot().established
+                && node.snapshot().layout.devices.iter().all(|d| d.online)
+                && node.sharing_enabled()
+                && node.exchange.ready()
+        })
+    });
+    assert_eq!(c.nodes[0].snapshot().layout.placements(), positions);
+    assert_eq!(c.nodes[1].snapshot().layout.placements(), positions);
+    c.control(1, 0);
+    c.key(1, 65);
+    wait(|| c.probes[0].held.lock().unwrap().contains(&65));
+}
+
+#[test]
+fn incorrect_pairing_key_never_marks_a_member_established() {
+    let mut c = Cluster::new(1);
+    assert!(c.nodes[0].snapshot().established);
+    let info = test_device(2, 1920, 1080);
+    let config = Config {
+        device_id: info.id.clone(),
+        ..Config::default()
+    };
+    let rt = Runtime::with_info(&config, info.clone());
+    let probe = Arc::new(Probe::default());
+    start_with_input(
+        rt.clone(),
+        config.clone(),
+        [24; 32],
+        Some(c.address.clone()),
+        FakeInput {
+            probe: probe.clone(),
+            bounds: info.bounds,
+            mode: None,
+        },
+    )
+    .unwrap();
+    c.nodes.push(rt);
+    c.probes.push(probe);
+    c.configs.push(config);
+    wait(|| c.nodes[1].snapshot().reconnecting);
+    assert!(!c.nodes[1].snapshot().established);
+    assert!(!c.nodes[1].snapshot().connected);
 }
 #[test]
 fn old_protocol_is_rejected_without_affecting_existing_group() {
