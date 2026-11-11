@@ -32,7 +32,7 @@ Windows 的钩子属于各自的桌面，普通进程不能访问 Winlogon 桌�
 
 ## 安装与更新
 
-普通使用推荐双击 `mwb-v0.5.8-windows-x64.msi`，点击「安装」并确认管理员授权，主程序、服务及快捷方式会自动安装。后续更新运行新 MSI，卸载使用 Windows 设置。旧脚本安装可直接升级为 MSI；MSI 管理的目录不再用脚本安装/卸载。配对、布局和接收文件保留。详见 [安装与更新](install.md)。
+普通使用推荐双击 `mwb-v0.5.9-windows-x64.msi`，点击「安装」并确认管理员授权，主程序、服务及快捷方式会自动安装。后续更新运行新 MSI，卸载使用 Windows 设置。旧脚本安装可直接升级为 MSI；MSI 管理的目录不再用脚本安装/卸载。配对、布局和接收文件保留。可在主程序的「共享偏好」开启当前用户登录后的自启动；服务本身不启动主程序。详见 [安装与更新](install.md)。
 
 以下脚本方式用于开发和未交由 MSI 管理的旧部署：
 
@@ -75,7 +75,7 @@ $probe.ExitCode
 Get-Content -LiteralPath (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'MWB-Rust\input-service.log') -Tail 20
 ```
 
-代理启动记录应包含 `agent=0.5.8`、`system=true`、`integrity=0x4000`（或更高）、`uiAccess=true`；令牌会话号应与控制台一致。本地输入协议未变化，v0.5.5/v0.5.6/v0.5.7 服务也能被新版主程序使用，推荐通过 MSI 配套更新。失败记录同时带有 `threadDesktop`、`inputDesktop`、`desktopAccess` 和 `stationAccess`。附加后 `desktopAccess` 应包含 `0x1a9` 的全部访问位；若为 `0x189`，仍缺少已修正的 `0x20`。启动时尚未锁屏，输入桌面显示 `Default` 是正常的，应以失败时的快照为准。日志不记录键值、鼠标位置、PIN 或配对密钥。
+代理启动记录应包含 `agent=0.5.9`、`system=true`、`integrity=0x4000`（或更高）、`uiAccess=true`；令牌会话号应与控制台一致。本地输入协议未变化，v0.5.5 至 v0.5.8 服务也能被新版主程序使用，推荐通过 MSI 配套更新。失败记录同时带有 `threadDesktop`、`inputDesktop`、`desktopAccess` 和 `stationAccess`。附加后 `desktopAccess` 应包含 `0x1a9` 的全部访问位；若为 `0x189`，仍缺少已修正的 `0x20`。启动时尚未锁屏，输入桌面显示 `Default` 是正常的，应以失败时的快照为准。日志不记录键值、鼠标位置、PIN 或配对密钥。
 
 ## 输入与故障处理
 

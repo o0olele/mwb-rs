@@ -65,14 +65,19 @@
     <CustomAction Id="CheckInstallation" BinaryKey="SetupChecker"
                   ExeCommand="--check-installation &quot;[INSTALLFOLDER]mwb.exe&quot;"
                   Execute="immediate" Return="check" />
+    <!-- Preserve opt-in across upgrades. On uninstall, remove only the invoking
+         user's entry if it still points to this installed executable. -->
+    <CustomAction Id="RemoveCurrentUserStartup" FileKey="MainExecutable"
+                  ExeCommand="--remove-autostart" Execute="immediate" Return="ignore" Impersonate="yes" />
     <InstallExecuteSequence>
       <Custom Action="CheckInstallation" Before="InstallInitialize">NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="RemoveCurrentUserStartup" Before="RemoveFiles">REMOVE = "ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
     </InstallExecuteSequence>
 
     <!-- This is a client UI action, so the app keeps the original user's profile. -->
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="打开 MWB Rust" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
-    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="以后可从桌面打开 MWB。成功配对后，再次打开会自动连接。" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="成功配对后，再次打开会自动连接。可在共享偏好开启开机自启动。" />
     <Property Id="WixShellExecTarget" Value="[#MainExecutable]" />
     <CustomAction Id="LaunchApplication" BinaryKey="WixCA" DllEntry="WixShellExec" Impersonate="yes" />
 

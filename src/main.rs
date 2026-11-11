@@ -13,9 +13,10 @@ use mwb::{
     },
     engine::{self, Runtime},
     exchange::{Phase, format_size},
+    instance,
     layout::{Layout, Point as LayoutPoint},
     pairing::SavedConnection,
-    platform,
+    platform, startup,
     switching::EdgeSwitchCondition,
 };
 use std::{
@@ -55,6 +56,8 @@ struct Workspace {
     fit_pending: bool,
     notice: String,
     input_service_notice: String,
+    startup_status: Option<startup::Status>,
+    startup_notice: String,
     show_key: bool,
     preparing: bool,
     start_generation: u64,
@@ -137,12 +140,15 @@ impl Workspace {
             fit_pending: true,
             notice,
             input_service_notice: mwb::input_service::installation_notice().unwrap_or_default(),
+            startup_status: None,
+            startup_notice: String::new(),
             show_key: false,
             preparing: false,
             start_generation: 0,
             pending_connection: None,
             _refresh: refresh,
         };
+        workspace.refresh_startup();
         if let Some(connect) = auto_start {
             workspace.start(connect, cx);
         }
@@ -152,6 +158,27 @@ impl Workspace {
     fn persist(&mut self) {
         if let Err(err) = self.config.save() {
             self.notice = format!("保存设置失败：{err:#}");
+        }
+    }
+
+    fn refresh_startup(&mut self) {
+        self.apply_startup_result(startup::status());
+    }
+
+    fn apply_startup_result(&mut self, result: anyhow::Result<startup::Status>) {
+        match result {
+            Ok(status) => {
+                self.startup_status = Some(status);
+                self.startup_notice = if status == startup::Status::OtherExecutable {
+                    "自启动当前指向其他位置；可改用正在运行的版本，或关闭自启动。".into()
+                } else {
+                    String::new()
+                };
+            }
+            Err(error) => {
+                self.startup_status = None;
+                self.startup_notice = format!("无法确认开机自启动设置：{error:#}");
+            }
         }
     }
 
@@ -704,6 +731,9 @@ impl Workspace {
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.tab = index;
+                            if index == 1 {
+                                this.refresh_startup();
+                            }
                             cx.notify();
                         }))
                 }),
@@ -1445,6 +1475,46 @@ impl Workspace {
                     })),
             ))
             .child(option_row(
+                "开机自启动",
+                "默认关闭；登录 Windows 后打开程序。请同时在 Windows「启动应用」中允许 MWB Rust。",
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("startup-toggle")
+                            .label(match self.startup_status {
+                                Some(startup::Status::Enabled) => "已设置",
+                                Some(startup::Status::Disabled) => "已关闭",
+                                Some(startup::Status::OtherExecutable) => "改用此版本",
+                                None => "重试读取",
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(status) = this.startup_status {
+                                    this.apply_startup_result(startup::set_enabled(
+                                        status != startup::Status::Enabled,
+                                    ));
+                                } else {
+                                    this.refresh_startup();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .when(
+                        self.startup_status == Some(startup::Status::OtherExecutable),
+                        |el| {
+                            el.child(Button::new("startup-disable").label("关闭").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.apply_startup_result(startup::set_enabled(false));
+                                    cx.notify();
+                                }),
+                            ))
+                        },
+                    ),
+            ))
+            .when(!self.startup_notice.is_empty(), |el| {
+                el.child(subtle(self.startup_notice.clone()))
+            })
+            .child(option_row(
                 "启动时自动连接",
                 "打开程序时恢复上次工作组；中心端恢复监听，加入端连接原中心。",
                 Button::new("auto-connect-toggle")
@@ -1557,7 +1627,7 @@ impl Workspace {
             .child(div().text_sm().child("当前支持：多设备工作组、自由屏幕布局、键鼠共享、自动文本/图片剪贴板、跨设备 Ctrl+V 粘贴文件与不限大小的文件传输。"))
             .child(div().text_sm().child("接收端可选安装锁屏输入服务，允许从其他电脑操作锁屏界面；安装方法见 README。控制端需保持解锁。"))
             .child(div().text_sm().child("后续计划：文件夹传输、断点续传、自动发现与托盘。"))
-            .child(div().text_sm().child("两端均需运行本重写版。首次配置后，打开程序自动恢复工作组；暂不提供远程 Ctrl+Alt+Delete。"))
+            .child(div().text_sm().child("两端均需运行本重写版。首次配置后，可在共享偏好开启开机自启动，登录 Windows 后自动恢复工作组；暂不提供远程 Ctrl+Alt+Delete。"))
             .child(div().text_xs().text_color(rgb(MUTED)).child("Native UI · GPUI Kit 0.8.1  /  Transport · Noise + ChaCha20-Poly1305"))
     }
 }
@@ -1770,6 +1840,17 @@ fn option_row(title: &'static str, desc: &'static str, control: impl IntoElement
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--remove-autostart") {
+        // MSI invokes this before deleting files, without opening the UI or
+        // acquiring the profile lock. Only this account's matching entry is removed.
+        std::process::exit(match startup::remove_if_current() {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("{error:#}");
+                1
+            }
+        });
+    }
     if std::env::args().nth(1).as_deref() == Some("--check-input-service") {
         // A deployment smoke check that never opens a window, installs a hook,
         // injects input or touches the clipboard. Read the exit code from the
@@ -1783,6 +1864,32 @@ fn main() {
             }
         });
     }
+    let _instance = match instance::acquire(&Config::path()) {
+        Ok(instance::Acquisition::Acquired(guard)) => guard,
+        Ok(instance::Acquisition::Running(pid)) => {
+            if let Some(pid) = pid {
+                instance::activate_existing(pid);
+            }
+            return;
+        }
+        Err(error) => {
+            // A release binary has no console; make startup failures visible.
+            use windows::{Win32::UI::WindowsAndMessaging::*, core::PCWSTR};
+            let text: Vec<u16> = format!("无法启动 MWB：{error:#}")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            unsafe {
+                MessageBoxW(
+                    None,
+                    PCWSTR(text.as_ptr()),
+                    windows::core::w!("MWB Rust"),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+            return;
+        }
+    };
     gpui_kit::application()
         .with_assets(assets::AllAssets)
         .run(|cx| {
@@ -1808,7 +1915,7 @@ fn main() {
                 ))),
                 window_min_size: Some(size(px(940.), px(720.))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("MWB · 无界协作".into()),
+                    title: Some(instance::WINDOW_TITLE.into()),
                     ..Default::default()
                 }),
                 ..Default::default()
